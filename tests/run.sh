@@ -73,6 +73,31 @@ test_github_username_validation() {
     fi
 }
 
+test_github_placeholder_rejected() {
+    if is_github_placeholder "GitHubUser" &&
+        is_github_placeholder "username" &&
+        is_github_placeholder "yourname" &&
+        is_github_placeholder "你的用户名" &&
+        ! is_github_placeholder "ike-sh"; then
+        pass "GitHub placeholder usernames rejected"
+    else
+        fail "GitHub placeholder usernames rejected"
+    fi
+}
+
+test_github_empty_hint() {
+    tmp=$(make_test_dir)
+    print_github_empty_hint "empty-user" > "$tmp/out" 2>&1
+    if grep -q "未获取到 GitHub 公钥" "$tmp/out" &&
+        grep -q "https://github.com/empty-user.keys" "$tmp/out" &&
+        grep -q "Authentication Key" "$tmp/out"; then
+        pass "GitHub .keys empty friendly hint"
+    else
+        fail "GitHub .keys empty friendly hint"
+    fi
+    rm -rf "$tmp"
+}
+
 test_public_key_validation() {
     if normalize_key_line "$VALID_KEY" >/dev/null &&
         normalize_key_line "$VALID_KEY_2" >/dev/null &&
@@ -181,9 +206,53 @@ test_sshd_config_settings() {
     rm -rf "$tmp"
 }
 
+test_sshd_config_password_auth_no() {
+    tmp=$(make_test_dir)
+    in="$tmp/sshd_config"
+    out="$tmp/out"
+    printf '%s\n' "PasswordAuthentication yes" > "$in"
+    write_hardened_sshd_config "$in" "$out"
+    if grep -q '^PasswordAuthentication no$' "$out"; then
+        pass "sshd_config sets PasswordAuthentication no"
+    else
+        fail "sshd_config sets PasswordAuthentication no"
+    fi
+    rm -rf "$tmp"
+}
+
+test_sshd_config_pubkey_yes() {
+    tmp=$(make_test_dir)
+    in="$tmp/sshd_config"
+    out="$tmp/out"
+    printf '%s\n' "PubkeyAuthentication no" > "$in"
+    write_hardened_sshd_config "$in" "$out"
+    if grep -q '^PubkeyAuthentication yes$' "$out"; then
+        pass "sshd_config sets PubkeyAuthentication yes"
+    else
+        fail "sshd_config sets PubkeyAuthentication yes"
+    fi
+    rm -rf "$tmp"
+}
+
+test_sshd_config_permit_root() {
+    tmp=$(make_test_dir)
+    in="$tmp/sshd_config"
+    out="$tmp/out"
+    printf '%s\n' "PermitRootLogin yes" > "$in"
+    write_hardened_sshd_config "$in" "$out"
+    if grep -q '^PermitRootLogin prohibit-password$' "$out"; then
+        pass "sshd_config sets PermitRootLogin prohibit-password"
+    else
+        fail "sshd_config sets PermitRootLogin prohibit-password"
+    fi
+    rm -rf "$tmp"
+}
+
 test_sshd_t_failure_restores_backup() {
     tmp=$(make_test_dir)
     old_path=$PATH
+    old_ssh_config=$SSH_CONFIG
+    old_run_sshd_dir=$RUN_SSHD_DIR
     mkdir -p "$tmp/bin"
     SSH_CONFIG="$tmp/sshd_config"
     RUN_SSHD_DIR="$tmp/run/sshd"
@@ -204,6 +273,8 @@ MOCK_SSHD
         fail "sshd -t failure restores backup"
     fi
     PATH=$old_path
+    SSH_CONFIG=$old_ssh_config
+    RUN_SSHD_DIR=$old_run_sshd_dir
     unset IKE_TEST_UID
     rm -rf "$tmp"
 }
@@ -211,6 +282,8 @@ MOCK_SSHD
 test_restart_failure_restores_backup() {
     tmp=$(make_test_dir)
     old_path=$PATH
+    old_ssh_config=$SSH_CONFIG
+    old_run_sshd_dir=$RUN_SSHD_DIR
     mkdir -p "$tmp/bin"
     SSH_CONFIG="$tmp/sshd_config"
     RUN_SSHD_DIR="$tmp/run/sshd"
@@ -243,7 +316,66 @@ MOCK_RC
         fail "restart failure restores backup"
     fi
     PATH=$old_path
+    SSH_CONFIG=$old_ssh_config
+    RUN_SSHD_DIR=$old_run_sshd_dir
     unset IKE_TEST_UID
+    rm -rf "$tmp"
+}
+
+test_restore_latest_sshd_config_backup() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    old_ssh_config=$SSH_CONFIG
+    old_run_sshd_dir=$RUN_SSHD_DIR
+    mkdir -p "$tmp/bin"
+    SSH_CONFIG="$tmp/sshd_config"
+    RUN_SSHD_DIR="$tmp/run/sshd"
+    IKE_TEST_UID=0
+    export IKE_TEST_UID
+    printf '%s\n' "PasswordAuthentication yes" > "$SSH_CONFIG"
+    printf '%s\n' "PasswordAuthentication maybe" > "$SSH_CONFIG.bak.20260429_083759"
+    printf '%s\n' "PasswordAuthentication no" > "$SSH_CONFIG.bak.20260429_090000"
+    cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
+#!/bin/sh
+exit 0
+MOCK_SSHD
+    cat > "$tmp/bin/systemctl" <<'MOCK_SYSTEMCTL'
+#!/bin/sh
+exit 0
+MOCK_SYSTEMCTL
+    chmod +x "$tmp/bin/sshd" "$tmp/bin/systemctl"
+    PATH="$tmp/bin:$PATH"
+    backup=$(latest_sshd_backup)
+    if restore_sshd_config_from_backup "$backup" >/dev/null 2>&1 &&
+        grep -q '^PasswordAuthentication no$' "$SSH_CONFIG"; then
+        pass "restore latest sshd_config backup"
+    else
+        fail "restore latest sshd_config backup"
+    fi
+    PATH=$old_path
+    SSH_CONFIG=$old_ssh_config
+    RUN_SSHD_DIR=$old_run_sshd_dir
+    unset IKE_TEST_UID
+    rm -rf "$tmp"
+}
+
+test_restore_latest_authorized_keys_backup() {
+    tmp=$(make_test_dir)
+    setup_home "$tmp"
+    mkdir -p "$IKE_TEST_HOME/.ssh"
+    auth="$IKE_TEST_HOME/.ssh/authorized_keys"
+    printf '%s\n' "old" > "$auth"
+    printf '%s\n' "$VALID_KEY" > "$auth.bak.20260429_083759"
+    printf '%s\n' "$VALID_KEY_2" > "$auth.bak.20260429_090000"
+    backup=$(latest_authorized_keys_backup)
+    if restore_authorized_keys_from_backup "$backup" >/dev/null 2>&1 &&
+        grep -Fxq "$VALID_KEY_2" "$auth" &&
+        has_mode "$auth" 600; then
+        pass "restore latest authorized_keys backup"
+    else
+        fail "restore latest authorized_keys backup"
+    fi
+    clear_test_user
     rm -rf "$tmp"
 }
 
@@ -292,15 +424,40 @@ MOCK_KEYGEN
     rm -rf "$tmp"
 }
 
-test_cli_parsing() {
+test_cli_github_parsing() {
     if parse_cli_args github ike-sh &&
         [ "$CLI_MODE" = "github" ] &&
-        [ "$CLI_GITHUB_USER" = "ike-sh" ] &&
-        parse_cli_args gen &&
-        [ "$CLI_MODE" = "gen" ]; then
-        pass "CLI argument parsing"
+        [ "$CLI_GITHUB_USER" = "ike-sh" ]; then
+        pass "CLI github subcommand parsing"
     else
-        fail "CLI argument parsing"
+        fail "CLI github subcommand parsing"
+    fi
+}
+
+test_cli_gen_parsing() {
+    if parse_cli_args gen &&
+        [ "$CLI_MODE" = "gen" ]; then
+        pass "CLI gen subcommand parsing"
+    else
+        fail "CLI gen subcommand parsing"
+    fi
+}
+
+test_cli_restore_parsing() {
+    if parse_cli_args restore &&
+        [ "$CLI_MODE" = "restore" ]; then
+        pass "CLI restore subcommand parsing"
+    else
+        fail "CLI restore subcommand parsing"
+    fi
+}
+
+test_cli_status_parsing() {
+    if parse_cli_args status &&
+        [ "$CLI_MODE" = "status" ]; then
+        pass "CLI status subcommand parsing"
+    else
+        fail "CLI status subcommand parsing"
     fi
 }
 
@@ -308,7 +465,7 @@ test_menu_output() {
     tmp=$(make_test_dir)
     show_menu > "$tmp/menu"
     if grep -q "SSH 密钥登录配置" "$tmp/menu" &&
-        grep -q "请选择 \[1-3\]" "$tmp/menu"; then
+        grep -q "请选择 \[1-5\]" "$tmp/menu"; then
         pass "no-arg menu function"
     else
         fail "no-arg menu function"
@@ -327,6 +484,42 @@ test_color_output() {
     rm -rf "$tmp"
 }
 
+test_status_output() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    setup_home "$tmp"
+    mkdir -p "$tmp/bin" "$IKE_TEST_HOME/.ssh"
+    printf '%s\n' "$VALID_KEY" > "$IKE_TEST_HOME/.ssh/authorized_keys"
+    cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
+#!/bin/sh
+if [ "$1" = "-T" ]; then
+    printf '%s\n' "port 22"
+    printf '%s\n' "permitrootlogin prohibit-password"
+    printf '%s\n' "pubkeyauthentication yes"
+    printf '%s\n' "passwordauthentication no"
+    exit 0
+fi
+exit 0
+MOCK_SSHD
+    cat > "$tmp/bin/ss" <<'MOCK_SS'
+#!/bin/sh
+printf '%s\n' 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=1,fd=3))'
+MOCK_SS
+    chmod +x "$tmp/bin/sshd" "$tmp/bin/ss"
+    PATH="$tmp/bin:$PATH"
+    show_status > "$tmp/status"
+    if grep -q "当前用户: testuser" "$tmp/status" &&
+        grep -q "passwordauthentication no" "$tmp/status" &&
+        grep -q "sshd" "$tmp/status"; then
+        pass "status outputs key SSH settings"
+    else
+        fail "status outputs key SSH settings"
+    fi
+    PATH=$old_path
+    clear_test_user
+    rm -rf "$tmp"
+}
+
 test_no_forbidden_features() {
     if grep -E "curl \\| sh|--docker|--warp|--dd|--site|--ssl|install docker|bbr" "$ROOT_DIR/init.sh" >/dev/null 2>&1; then
         fail "no forbidden feature implementation"
@@ -336,19 +529,30 @@ test_no_forbidden_features() {
 }
 
 test_github_username_validation
+test_github_placeholder_rejected
+test_github_empty_hint
 test_public_key_validation
 test_github_keys_filtering
 test_authorized_keys_append_dedup_and_permissions
 test_symlink_ssh_rejected
 test_symlink_authorized_keys_rejected
 test_sshd_config_settings
+test_sshd_config_password_auth_no
+test_sshd_config_pubkey_yes
+test_sshd_config_permit_root
 test_sshd_t_failure_restores_backup
 test_restart_failure_restores_backup
+test_restore_latest_sshd_config_backup
+test_restore_latest_authorized_keys_backup
 test_gen_without_ssh_keygen_fails
 test_gen_mock_ed25519
-test_cli_parsing
+test_cli_github_parsing
+test_cli_gen_parsing
+test_cli_restore_parsing
+test_cli_status_parsing
 test_menu_output
 test_color_output
+test_status_output
 test_no_forbidden_features
 
 if [ "$FAIL_COUNT" -gt 0 ]; then

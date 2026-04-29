@@ -183,6 +183,16 @@ validate_github_username() {
     return 0
 }
 
+is_github_placeholder() {
+    name="$1"
+    case "$name" in
+        GitHubUser|githubuser|username|yourname|你的用户名)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
 normalize_key_line() {
     line=$(printf '%s\n' "$1" | awk '{$1=$1; print}')
     key_type=$(printf '%s\n' "$line" | awk '{print $1}')
@@ -230,7 +240,10 @@ filter_valid_keys() {
 fetch_github_keys() {
     user="$1"
     output_file="$2"
-    validate_github_username "$user" || die "GitHub 用户名格式无效。"
+    validate_github_username "$user" || {
+        error "GitHub 用户名格式无效。"
+        return 1
+    }
     url="https://github.com/$user.keys"
     info "正在拉取 GitHub 公钥..."
     if command -v curl >/dev/null 2>&1; then
@@ -238,9 +251,10 @@ fetch_github_keys() {
     elif command -v wget >/dev/null 2>&1; then
         wget -qO- "$url" > "$output_file" || return 1
     else
-        die "缺少 curl 或 wget，无法拉取 GitHub 公钥。"
+        error "缺少 curl 或 wget，无法拉取 GitHub 公钥。"
+        return 1
     fi
-    [ -s "$output_file" ] || die "GitHub .keys 内容为空。"
+    [ -s "$output_file" ] || return 2
 }
 
 backup_authorized_keys() {
@@ -309,15 +323,72 @@ append_keys_to_authorized_keys() {
     success "已导入 $added 条新公钥。"
 }
 
+print_github_empty_hint() {
+    github_user="$1"
+    error "未获取到 GitHub 公钥，请确认："
+    printf '%s\n' "1. GitHub 用户名是否正确"
+    printf '%s\n' "2. 该用户是否已在 GitHub Settings -> SSH and GPG keys 添加 Authentication Key"
+    printf '%s\n' "3. 浏览器访问 https://github.com/$github_user.keys 是否能看到 ssh-ed25519 / ssh-rsa 开头的公钥"
+}
+
+print_execution_summary() {
+    github_user="$1"
+    user=$(current_user)
+    home=$(home_dir_for_user "$user")
+    printf '%s\n' "当前用户: $user"
+    printf '%s\n' "HOME: $home"
+    if [ -n "$github_user" ]; then
+        printf '%s\n' "GitHub 用户名: $github_user"
+    fi
+    printf '%s\n' "将写入: $home/.ssh/authorized_keys"
+    printf '%s\n' "将修改: $SSH_CONFIG"
+    printf '%s\n' "将禁用密码登录: 是"
+    printf '%s\n' "将保留 root 密钥登录: PermitRootLogin prohibit-password"
+}
+
+confirm_yes() {
+    prompt="$1"
+    printf '%s' "$prompt"
+    IFS= read -r answer
+    [ "$answer" = "yes" ]
+}
+
 github_mode() {
     github_user="$1"
-    validate_github_username "$github_user" || die "GitHub 用户名格式无效。"
+    if [ -z "$github_user" ]; then
+        error "GitHub 用户名不能为空。"
+        return 1
+    fi
+    if is_github_placeholder "$github_user"; then
+        error "你输入的是示例占位符，请输入真实 GitHub 用户名。"
+        return 1
+    fi
+    validate_github_username "$github_user" || {
+        error "GitHub 用户名格式无效。"
+        return 1
+    }
     raw_file=$(make_tmp_file "github-keys")
     valid_file=$(make_tmp_file "valid-keys")
-    fetch_github_keys "$github_user" "$raw_file" || die "拉取 GitHub 公钥失败。"
+    fetch_rc=0
+    fetch_github_keys "$github_user" "$raw_file" || fetch_rc=$?
+    if [ "$fetch_rc" -eq 2 ]; then
+        print_github_empty_hint "$github_user"
+        return 1
+    fi
+    if [ "$fetch_rc" -ne 0 ]; then
+        error "拉取 GitHub 公钥失败。"
+        return 1
+    fi
     count=$(filter_valid_keys "$raw_file" "$valid_file")
-    [ "$count" -gt 0 ] || die "没有有效的 GitHub 公钥。"
+    if [ "$count" -le 0 ]; then
+        print_github_empty_hint "$github_user"
+        return 1
+    fi
     success "已获取 $count 条有效公钥"
+    print_execution_summary "$github_user"
+    if [ "${SSH_INIT_ASSUME_YES:-0}" != "1" ]; then
+        confirm_yes "确认执行？输入 yes 继续: " || return 1
+    fi
     append_keys_to_authorized_keys "$valid_file"
     harden_ssh_config
     final_reminder
@@ -354,6 +425,12 @@ print_generated_private_key() {
 }
 
 gen_mode() {
+    warn "此模式会在服务器临时生成私钥，并打印到终端。"
+    warn "请只在可信服务器和可信终端使用。"
+    warn "复制保存私钥后，服务器临时私钥会被删除。"
+    if [ "${SSH_INIT_ASSUME_YES:-0}" != "1" ]; then
+        confirm_yes "确认生成？输入 yes 继续: " || return 1
+    fi
     valid_file=$(make_tmp_file "valid-keys")
     generate_ed25519_key_pair
     count=$(filter_valid_keys "$GENERATED_PUBLIC_KEY_FILE" "$valid_file")
@@ -474,38 +551,226 @@ harden_ssh_config() {
     info "PermitRootLogin prohibit-password 表示禁止 root 密码登录，但允许 root 密钥登录。"
 }
 
+current_auth_file() {
+    user=$(current_user)
+    home=$(home_dir_for_user "$user")
+    printf '%s\n' "$home/.ssh/authorized_keys"
+}
+
+latest_matching_file() {
+    pattern="$1"
+    latest=""
+    latest_base=""
+    # shellcheck disable=SC2086
+    for file in $pattern; do
+        [ -f "$file" ] || continue
+        base=${file##*/}
+        if [ -z "$latest_base" ] || awk -v a="$base" -v b="$latest_base" 'BEGIN { exit (a > b) ? 0 : 1 }'; then
+            latest="$file"
+            latest_base="$base"
+        fi
+    done
+    [ -n "$latest" ] || return 1
+    printf '%s\n' "$latest"
+}
+
+latest_sshd_backup() {
+    latest_matching_file "$SSH_CONFIG.bak.*"
+}
+
+latest_authorized_keys_backup() {
+    auth_file=$(current_auth_file)
+    latest_matching_file "$auth_file.bak.*"
+}
+
+list_backups() {
+    info "可用 sshd_config 备份："
+    i=1
+    for file in "$SSH_CONFIG".bak.*; do
+        [ -f "$file" ] || continue
+        printf '%s) %s\n' "$i" "$file"
+        i=$((i + 1))
+    done
+    [ "$i" -gt 1 ] || printf '%s\n' "(无)"
+
+    auth_file=$(current_auth_file)
+    info "可用 authorized_keys 备份："
+    i=1
+    for file in "$auth_file".bak.*; do
+        [ -f "$file" ] || continue
+        printf '%s) %s\n' "$i" "$file"
+        i=$((i + 1))
+    done
+    [ "$i" -gt 1 ] || printf '%s\n' "(无)"
+}
+
+restore_sshd_config_from_backup() {
+    backup="$1"
+    [ -f "$backup" ] || {
+        error "没有找到 sshd_config 备份。"
+        return 1
+    }
+    require_root
+    before="$SSH_CONFIG.before-restore.$(timestamp)"
+    cp -p "$SSH_CONFIG" "$before" || return 1
+    if ! cp -p "$backup" "$SSH_CONFIG"; then
+        cp -p "$before" "$SSH_CONFIG" || true
+        return 1
+    fi
+    if ! validate_sshd_config; then
+        cp -p "$before" "$SSH_CONFIG" || true
+        error "恢复后的 sshd_config 未通过 sshd -t，已还原当前配置。"
+        return 1
+    fi
+    if ! restart_ssh_service; then
+        cp -p "$before" "$SSH_CONFIG" || true
+        restart_ssh_service >/dev/null 2>&1 || true
+        error "SSH 服务重启失败，已还原当前配置。"
+        return 1
+    fi
+    success "sshd_config 已恢复并重启 SSH。"
+}
+
+restore_authorized_keys_from_backup() {
+    backup="$1"
+    [ -f "$backup" ] || {
+        error "没有找到 authorized_keys 备份。"
+        return 1
+    }
+    auth_file=$(current_auth_file)
+    user=$(current_user)
+    ssh_dir=$(dirname "$auth_file")
+    ! is_symlink_path "$ssh_dir" || {
+        error ".ssh 不能是 symlink。"
+        return 1
+    }
+    ! is_symlink_path "$auth_file" || {
+        error "authorized_keys 不能是 symlink。"
+        return 1
+    }
+    mkdir -p "$ssh_dir" || return 1
+    if [ -e "$auth_file" ] && [ ! -f "$auth_file" ]; then
+        error "authorized_keys 不是普通文件。"
+        return 1
+    fi
+    cp -p "$backup" "$auth_file" || return 1
+    set_mode 600 "$auth_file" || return 1
+    set_owner "$auth_file" "$user" || return 1
+    success "authorized_keys 已恢复。"
+}
+
+restore_menu() {
+    list_backups
+    cat <<'EOF'
+1) 恢复最新 sshd_config 备份
+2) 恢复最新 authorized_keys 备份
+3) 同时恢复最新 sshd_config 和 authorized_keys
+4) 返回主菜单
+EOF
+    printf '%s' "请选择 [1-4]: "
+    IFS= read -r choice
+    case "$choice" in
+        1)
+            backup=$(latest_sshd_backup 2>/dev/null || true)
+            restore_sshd_config_from_backup "$backup" && info "请新开终端测试 SSH 登录是否恢复正常。"
+            ;;
+        2)
+            backup=$(latest_authorized_keys_backup 2>/dev/null || true)
+            restore_authorized_keys_from_backup "$backup" && info "请新开终端测试 SSH 登录是否恢复正常。"
+            ;;
+        3)
+            ssh_backup=$(latest_sshd_backup 2>/dev/null || true)
+            auth_backup=$(latest_authorized_keys_backup 2>/dev/null || true)
+            restore_sshd_config_from_backup "$ssh_backup" && restore_authorized_keys_from_backup "$auth_backup" && info "请新开终端测试 SSH 登录是否恢复正常。"
+            ;;
+        4)
+            return 0
+            ;;
+        *)
+            error "无效选择。"
+            return 1
+            ;;
+    esac
+}
+
+show_status() {
+    user=$(current_user)
+    home=$(home_dir_for_user "$user")
+    auth_file="$home/.ssh/authorized_keys"
+    printf '%s\n' "当前用户: $user"
+    printf '%s\n' "HOME: $home"
+    if [ -d "$home/.ssh" ]; then
+        # shellcheck disable=SC2012
+        printf '%s\n' ".ssh 权限: $(ls -ld "$home/.ssh" | awk '{print $1}')"
+    else
+        printf '%s\n' ".ssh 不存在"
+    fi
+    if [ -f "$auth_file" ]; then
+        # shellcheck disable=SC2012
+        printf '%s\n' "authorized_keys: 存在，权限 $(ls -l "$auth_file" | awk '{print $1}')，行数 $(wc -l < "$auth_file" | awk '{print $1}')"
+    else
+        printf '%s\n' "authorized_keys 不存在"
+    fi
+    if command -v sshd >/dev/null 2>&1; then
+        sshd -T 2>/dev/null | grep -Ei '^(port|permitrootlogin|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|permitemptypasswords)' || true
+    elif [ -x /usr/sbin/sshd ]; then
+        /usr/sbin/sshd -T 2>/dev/null | grep -Ei '^(port|permitrootlogin|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|permitemptypasswords)' || true
+    fi
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltnp 2>/dev/null | grep sshd || true
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -ltnp 2>/dev/null | grep sshd || true
+    fi
+}
+
 show_menu() {
     cat <<'MENU'
-================ SSH 密钥登录配置 ================
-1. 生成全新的 Ed25519 密钥对，并配置当前用户免密登录
-2. 输入 GitHub 用户名，拉取 GitHub 公钥并配置当前用户免密登录
-3. 退出
-=================================================
-请选择 [1-3]:
+================ SSH 密钥登录配置工具 ================
+1. 从 GitHub 导入公钥并禁用密码登录
+2. 在服务器生成 Ed25519 密钥并禁用密码登录
+3. 恢复 SSH 配置备份
+4. 查看当前 SSH 登录配置
+5. 退出
+====================================================
+请选择 [1-5]:
 MENU
 }
 
 interactive_main() {
-    show_menu
-    IFS= read -r choice
-    case "$choice" in
-        1)
-            require_root
-            gen_mode
-            ;;
-        2)
-            require_root
-            printf '%s' "请输入 GitHub 用户名: "
-            IFS= read -r github_user
-            github_mode "$github_user"
-            ;;
-        3)
-            info "已退出。"
-            ;;
-        *)
-            die "无效选择。"
-            ;;
-    esac
+    while :; do
+        show_menu
+        IFS= read -r choice
+        case "$choice" in
+            1)
+                require_root
+                printf '%s' "请输入 GitHub 用户名: "
+                IFS= read -r github_user
+                if github_mode "$github_user"; then
+                    return 0
+                fi
+                ;;
+            2)
+                require_root
+                if gen_mode; then
+                    return 0
+                fi
+                ;;
+            3)
+                require_root
+                restore_menu || true
+                ;;
+            4)
+                show_status
+                ;;
+            5)
+                info "已退出。"
+                return 0
+                ;;
+            *)
+                error "无效选择。"
+                ;;
+        esac
+    done
 }
 
 final_reminder() {
@@ -525,6 +790,8 @@ usage() {
   sh init.sh
   sh init.sh github GitHubUser
   sh init.sh gen
+  sh init.sh restore
+  sh init.sh status
 EOF
 }
 
@@ -545,6 +812,14 @@ parse_cli_args() {
         gen)
             [ "$#" -eq 1 ] || return 1
             CLI_MODE="gen"
+            ;;
+        restore)
+            [ "$#" -eq 1 ] || return 1
+            CLI_MODE="restore"
+            ;;
+        status)
+            [ "$#" -eq 1 ] || return 1
+            CLI_MODE="status"
             ;;
         -h|--help)
             CLI_MODE="help"
@@ -573,6 +848,13 @@ main() {
         gen)
             require_root
             gen_mode
+            ;;
+        restore)
+            require_root
+            restore_menu
+            ;;
+        status)
+            show_status
             ;;
         help)
             usage
