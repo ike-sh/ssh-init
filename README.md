@@ -121,6 +121,16 @@ sh init.sh
 
 恢复菜单可以恢复最新的 `sshd_config` 备份、最新的 `authorized_keys` 备份，或同时恢复二者。恢复 `sshd_config` 后脚本会再次执行 `sshd -t` 并重启 SSH 服务。
 
+“恢复最新备份”表示恢复到脚本上次修改前的状态。`authorized_keys` 恢复不是清空文件，而是恢复备份文件内容；如果恢复后仍有公钥行，说明备份中本来就有这些公钥。
+
+恢复菜单还提供“清空当前用户 authorized_keys（危险）”选项。这个操作会先创建：
+
+```text
+~/.ssh/authorized_keys.before-clear.YYYYmmdd_HHMMSS
+```
+
+然后清空当前用户所有 SSH 公钥。执行前必须输入大写 `YES`，不建议在没有 VNC/Console 的情况下使用。
+
 命令行兼容模式：
 
 ```sh

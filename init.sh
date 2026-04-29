@@ -14,6 +14,7 @@ GENERATED_PUBLIC_KEY_FILE=""
 AUTHORIZED_KEYS_FILE=""
 CLI_MODE=""
 CLI_GITHUB_USER=""
+ASK_REPLY=""
 
 BLUE=$(printf '\033[34m')
 GREEN=$(printf '\033[32m')
@@ -40,6 +41,16 @@ error() {
 die() {
     error "$*"
     exit 1
+}
+
+ask_prompt() {
+    prompt="$1"
+    printf '%s ' "$prompt"
+    if IFS= read -r ASK_REPLY; then
+        return 0
+    fi
+    ASK_REPLY=""
+    return 1
 }
 
 cleanup_tmp() {
@@ -348,9 +359,8 @@ print_execution_summary() {
 
 confirm_yes() {
     prompt="$1"
-    printf '%s' "$prompt"
-    IFS= read -r answer
-    [ "$answer" = "yes" ]
+    ask_prompt "$prompt" || return 1
+    [ "$ASK_REPLY" = "yes" ]
 }
 
 github_mode() {
@@ -387,7 +397,7 @@ github_mode() {
     success "已获取 $count 条有效公钥"
     print_execution_summary "$github_user"
     if [ "${SSH_INIT_ASSUME_YES:-0}" != "1" ]; then
-        confirm_yes "确认执行？输入 yes 继续: " || return 1
+        confirm_yes "确认执行？输入 yes 继续:" || return 1
     fi
     append_keys_to_authorized_keys "$valid_file"
     harden_ssh_config
@@ -429,7 +439,7 @@ gen_mode() {
     warn "请只在可信服务器和可信终端使用。"
     warn "复制保存私钥后，服务器临时私钥会被删除。"
     if [ "${SSH_INIT_ASSUME_YES:-0}" != "1" ]; then
-        confirm_yes "确认生成？输入 yes 继续: " || return 1
+        confirm_yes "确认生成？输入 yes 继续:" || return 1
     fi
     valid_file=$(make_tmp_file "valid-keys")
     generate_ed25519_key_pair
@@ -583,25 +593,62 @@ latest_authorized_keys_backup() {
     latest_matching_file "$auth_file.bak.*"
 }
 
-list_backups() {
-    info "可用 sshd_config 备份："
-    i=1
-    for file in "$SSH_CONFIG".bak.*; do
+list_matching_files_reverse() {
+    pattern="$1"
+    # shellcheck disable=SC2086
+    for file in $pattern; do
         [ -f "$file" ] || continue
-        printf '%s) %s\n' "$i" "$file"
-        i=$((i + 1))
-    done
-    [ "$i" -gt 1 ] || printf '%s\n' "(无)"
+        printf '%s\n' "$file"
+    done | sort -r
+}
+
+list_backups() {
+    info "恢复最新备份表示恢复到脚本上次修改前的状态。"
+    info "authorized_keys 恢复不是清空，而是恢复备份文件内容。"
+    info "恢复后仍可能存在已有公钥，这是正常现象。"
+    info "可用 sshd_config 备份："
+    files=$(list_matching_files_reverse "$SSH_CONFIG.bak.*")
+    if [ -n "$files" ]; then
+        printf '%s\n' "$files" | awk '{print NR ") " $0}'
+    else
+        printf '%s\n' "(无)"
+    fi
 
     auth_file=$(current_auth_file)
     info "可用 authorized_keys 备份："
-    i=1
-    for file in "$auth_file".bak.*; do
-        [ -f "$file" ] || continue
-        printf '%s) %s\n' "$i" "$file"
-        i=$((i + 1))
-    done
-    [ "$i" -gt 1 ] || printf '%s\n' "(无)"
+    files=$(list_matching_files_reverse "$auth_file.bak.*")
+    if [ -n "$files" ]; then
+        printf '%s\n' "$files" | awk '{print NR ") " $0}'
+    else
+        printf '%s\n' "(无)"
+    fi
+}
+
+show_effective_ssh_config() {
+    if command -v sshd >/dev/null 2>&1; then
+        sshd -T 2>/dev/null | grep -Ei '^(port|permitrootlogin|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|permitemptypasswords)' || true
+    elif [ -x /usr/sbin/sshd ]; then
+        /usr/sbin/sshd -T 2>/dev/null | grep -Ei '^(port|permitrootlogin|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|permitemptypasswords)' || true
+    fi
+}
+
+get_effective_sshd_value() {
+    key="$1"
+    show_effective_ssh_config | awk -v k="$key" 'tolower($1) == tolower(k) { print $2; exit }'
+}
+
+show_authorized_keys_summary() {
+    auth_file="$1"
+    info "authorized_keys 路径: $auth_file"
+    if [ -f "$auth_file" ]; then
+        # shellcheck disable=SC2012
+        perms=$(ls -l "$auth_file" | awk '{print $1}')
+        lines=$(wc -l < "$auth_file" | awk '{print $1}')
+        info "authorized_keys 权限: $perms"
+        info "authorized_keys 行数: $lines"
+    else
+        info "authorized_keys 不存在"
+    fi
 }
 
 restore_sshd_config_from_backup() {
@@ -628,7 +675,14 @@ restore_sshd_config_from_backup() {
         error "SSH 服务重启失败，已还原当前配置。"
         return 1
     fi
-    success "sshd_config 已恢复并重启 SSH。"
+    success "sshd_config 已恢复。"
+    success "SSH 服务已重启。"
+    show_effective_ssh_config
+    password_auth=$(get_effective_sshd_value "passwordauthentication")
+    permit_root=$(get_effective_sshd_value "permitrootlogin")
+    [ -n "$password_auth" ] && info "当前 PasswordAuthentication: $password_auth"
+    [ -n "$permit_root" ] && info "当前 PermitRootLogin: $permit_root"
+    return 0
 }
 
 restore_authorized_keys_from_backup() {
@@ -653,10 +707,61 @@ restore_authorized_keys_from_backup() {
         error "authorized_keys 不是普通文件。"
         return 1
     fi
+    set_mode 700 "$ssh_dir" || return 1
+    set_owner "$ssh_dir" "$user" || return 1
     cp -p "$backup" "$auth_file" || return 1
     set_mode 600 "$auth_file" || return 1
     set_owner "$auth_file" "$user" || return 1
     success "authorized_keys 已恢复。"
+    show_authorized_keys_summary "$auth_file"
+    info "authorized_keys 已恢复为备份时的内容；这不是清空 authorized_keys；如果仍有公钥行，说明备份中本来就有这些公钥。"
+}
+
+clear_authorized_keys() {
+    auth_file=$(current_auth_file)
+    user=$(current_user)
+    ssh_dir=$(dirname "$auth_file")
+    ! is_symlink_path "$ssh_dir" || {
+        error ".ssh 不能是 symlink。"
+        return 1
+    }
+    ! is_symlink_path "$auth_file" || {
+        error "authorized_keys 不能是 symlink。"
+        return 1
+    }
+    mkdir -p "$ssh_dir" || return 1
+    if [ -e "$auth_file" ] && [ ! -f "$auth_file" ]; then
+        error "authorized_keys 不是普通文件。"
+        return 1
+    fi
+    set_mode 700 "$ssh_dir" || return 1
+    set_owner "$ssh_dir" "$user" || return 1
+    backup="$auth_file.before-clear.$(timestamp)"
+    if [ -f "$auth_file" ]; then
+        cp -p "$auth_file" "$backup" || return 1
+        success "已备份当前 authorized_keys: $backup"
+    else
+        : > "$backup" || return 1
+        set_mode 600 "$backup" || return 1
+        set_owner "$backup" "$user" || return 1
+        success "已创建 authorized_keys 空备份: $backup"
+        : > "$auth_file" || return 1
+    fi
+    : > "$auth_file" || return 1
+    set_mode 600 "$auth_file" || return 1
+    set_owner "$auth_file" "$user" || return 1
+    success "authorized_keys 已清空。"
+    show_authorized_keys_summary "$auth_file"
+}
+
+clear_authorized_keys_interactive() {
+    warn "这会删除当前用户所有 SSH 公钥，可能导致无法用密钥登录。"
+    ask_prompt "确认清空？输入 YES 继续:" || return 1
+    if [ "$ASK_REPLY" != "YES" ]; then
+        warn "已取消清空 authorized_keys。"
+        return 1
+    fi
+    clear_authorized_keys
 }
 
 restore_menu() {
@@ -665,10 +770,12 @@ restore_menu() {
 1) 恢复最新 sshd_config 备份
 2) 恢复最新 authorized_keys 备份
 3) 同时恢复最新 sshd_config 和 authorized_keys
-4) 返回主菜单
+4) 查看当前 SSH 登录配置
+5) 清空当前用户 authorized_keys（危险）
+6) 返回主菜单
 EOF
-    printf '%s' "请选择 [1-4]: "
-    IFS= read -r choice
+    ask_prompt "请选择 [1-6]:" || return 1
+    choice=$ASK_REPLY
     case "$choice" in
         1)
             backup=$(latest_sshd_backup 2>/dev/null || true)
@@ -684,6 +791,12 @@ EOF
             restore_sshd_config_from_backup "$ssh_backup" && restore_authorized_keys_from_backup "$auth_backup" && info "请新开终端测试 SSH 登录是否恢复正常。"
             ;;
         4)
+            show_status
+            ;;
+        5)
+            clear_authorized_keys_interactive && info "请新开终端测试 SSH 登录是否符合预期。"
+            ;;
+        6)
             return 0
             ;;
         *)
@@ -711,11 +824,7 @@ show_status() {
     else
         printf '%s\n' "authorized_keys 不存在"
     fi
-    if command -v sshd >/dev/null 2>&1; then
-        sshd -T 2>/dev/null | grep -Ei '^(port|permitrootlogin|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|permitemptypasswords)' || true
-    elif [ -x /usr/sbin/sshd ]; then
-        /usr/sbin/sshd -T 2>/dev/null | grep -Ei '^(port|permitrootlogin|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|permitemptypasswords)' || true
-    fi
+    show_effective_ssh_config
     if command -v ss >/dev/null 2>&1; then
         ss -ltnp 2>/dev/null | grep sshd || true
     elif command -v netstat >/dev/null 2>&1; then
@@ -732,19 +841,19 @@ show_menu() {
 4. 查看当前 SSH 登录配置
 5. 退出
 ====================================================
-请选择 [1-5]:
 MENU
 }
 
 interactive_main() {
     while :; do
         show_menu
-        IFS= read -r choice
+        ask_prompt "请选择 [1-5]:" || return 0
+        choice=$ASK_REPLY
         case "$choice" in
             1)
                 require_root
-                printf '%s' "请输入 GitHub 用户名: "
-                IFS= read -r github_user
+                ask_prompt "请输入 GitHub 用户名:" || return 0
+                github_user=$ASK_REPLY
                 if github_mode "$github_user"; then
                     return 0
                 fi

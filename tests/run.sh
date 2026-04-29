@@ -60,6 +60,19 @@ has_mode() {
     find "$path" -prune -perm "$mode" | grep -q .
 }
 
+test_ask_prompt_format() {
+    tmp=$(make_test_dir)
+    printf '%s\n' "4" > "$tmp/in"
+    ask_prompt "请选择 [1-5]:" < "$tmp/in" > "$tmp/out"
+    output=$(cat "$tmp/out")
+    if [ "$output" = "请选择 [1-5]: " ] && [ "$ASK_REPLY" = "4" ]; then
+        pass "ask_prompt output format has no extra newline"
+    else
+        fail "ask_prompt output format has no extra newline"
+    fi
+    rm -rf "$tmp"
+}
+
 test_github_username_validation() {
     if validate_github_username "ike-sh" &&
         validate_github_username "abc123" &&
@@ -359,6 +372,49 @@ MOCK_SYSTEMCTL
     rm -rf "$tmp"
 }
 
+test_restore_sshd_shows_effective_config() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    old_ssh_config=$SSH_CONFIG
+    old_run_sshd_dir=$RUN_SSHD_DIR
+    mkdir -p "$tmp/bin"
+    SSH_CONFIG="$tmp/sshd_config"
+    RUN_SSHD_DIR="$tmp/run/sshd"
+    IKE_TEST_UID=0
+    export IKE_TEST_UID
+    printf '%s\n' "PasswordAuthentication yes" > "$SSH_CONFIG"
+    printf '%s\n' "PasswordAuthentication no" > "$SSH_CONFIG.bak.20260429_090000"
+    cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
+#!/bin/sh
+if [ "$1" = "-T" ]; then
+    printf '%s\n' "passwordauthentication no"
+    printf '%s\n' "permitrootlogin prohibit-password"
+    exit 0
+fi
+exit 0
+MOCK_SSHD
+    cat > "$tmp/bin/systemctl" <<'MOCK_SYSTEMCTL'
+#!/bin/sh
+exit 0
+MOCK_SYSTEMCTL
+    chmod +x "$tmp/bin/sshd" "$tmp/bin/systemctl"
+    PATH="$tmp/bin:$PATH"
+    backup=$(latest_sshd_backup)
+    restore_sshd_config_from_backup "$backup" > "$tmp/out" 2>&1
+    if grep -q "passwordauthentication no" "$tmp/out" &&
+        grep -q "当前 PasswordAuthentication: no" "$tmp/out" &&
+        grep -q "当前 PermitRootLogin: prohibit-password" "$tmp/out"; then
+        pass "restore sshd_config shows effective status"
+    else
+        fail "restore sshd_config shows effective status"
+    fi
+    PATH=$old_path
+    SSH_CONFIG=$old_ssh_config
+    RUN_SSHD_DIR=$old_run_sshd_dir
+    unset IKE_TEST_UID
+    rm -rf "$tmp"
+}
+
 test_restore_latest_authorized_keys_backup() {
     tmp=$(make_test_dir)
     setup_home "$tmp"
@@ -368,12 +424,77 @@ test_restore_latest_authorized_keys_backup() {
     printf '%s\n' "$VALID_KEY" > "$auth.bak.20260429_083759"
     printf '%s\n' "$VALID_KEY_2" > "$auth.bak.20260429_090000"
     backup=$(latest_authorized_keys_backup)
-    if restore_authorized_keys_from_backup "$backup" >/dev/null 2>&1 &&
+    if restore_authorized_keys_from_backup "$backup" > "$tmp/out" 2>&1 &&
         grep -Fxq "$VALID_KEY_2" "$auth" &&
-        has_mode "$auth" 600; then
+        has_mode "$auth" 600 &&
+        grep -q "恢复为备份时的内容" "$tmp/out"; then
         pass "restore latest authorized_keys backup"
     else
         fail "restore latest authorized_keys backup"
+    fi
+    clear_test_user
+    rm -rf "$tmp"
+}
+
+test_restore_list_reverse_order() {
+    tmp=$(make_test_dir)
+    old_ssh_config=$SSH_CONFIG
+    SSH_CONFIG="$tmp/sshd_config"
+    setup_home "$tmp"
+    mkdir -p "$IKE_TEST_HOME/.ssh"
+    printf '%s\n' "current" > "$SSH_CONFIG"
+    printf '%s\n' "old" > "$SSH_CONFIG.bak.20260429_083759"
+    printf '%s\n' "new" > "$SSH_CONFIG.bak.20260429_090210"
+    printf '%s\n' "old" > "$IKE_TEST_HOME/.ssh/authorized_keys.bak.20260429_083759"
+    printf '%s\n' "new" > "$IKE_TEST_HOME/.ssh/authorized_keys.bak.20260429_090210"
+    list_backups > "$tmp/out"
+    first_sshd=$(awk '/sshd_config.bak/ { print; exit }' "$tmp/out")
+    first_auth=$(awk '/authorized_keys.bak/ { print; exit }' "$tmp/out")
+    if printf '%s\n' "$first_sshd" | grep -q '20260429_090210' &&
+        printf '%s\n' "$first_auth" | grep -q '20260429_090210'; then
+        pass "restore backup list shows newest first"
+    else
+        fail "restore backup list shows newest first"
+    fi
+    SSH_CONFIG=$old_ssh_config
+    clear_test_user
+    rm -rf "$tmp"
+}
+
+test_clear_authorized_keys_requires_yes() {
+    tmp=$(make_test_dir)
+    setup_home "$tmp"
+    mkdir -p "$IKE_TEST_HOME/.ssh"
+    auth="$IKE_TEST_HOME/.ssh/authorized_keys"
+    printf '%s\n' "$VALID_KEY" > "$auth"
+    printf '%s\n' "no" > "$tmp/in"
+    if clear_authorized_keys_interactive < "$tmp/in" > "$tmp/out" 2>&1; then
+        fail "clear authorized_keys requires uppercase YES"
+    elif grep -Fxq "$VALID_KEY" "$auth"; then
+        pass "clear authorized_keys requires uppercase YES"
+    else
+        fail "clear authorized_keys requires uppercase YES"
+    fi
+    clear_test_user
+    rm -rf "$tmp"
+}
+
+test_clear_authorized_keys_backup_and_empty() {
+    tmp=$(make_test_dir)
+    setup_home "$tmp"
+    mkdir -p "$IKE_TEST_HOME/.ssh"
+    auth="$IKE_TEST_HOME/.ssh/authorized_keys"
+    printf '%s\n' "$VALID_KEY" > "$auth"
+    printf '%s\n' "YES" > "$tmp/in"
+    clear_authorized_keys_interactive < "$tmp/in" > "$tmp/out" 2>&1
+    backup_count=$(find "$IKE_TEST_HOME/.ssh" -name 'authorized_keys.before-clear.*' | wc -l | awk '{print $1}')
+    lines=$(wc -l < "$auth" | awk '{print $1}')
+    if [ "$backup_count" = "1" ] &&
+        [ "$lines" = "0" ] &&
+        has_mode "$auth" 600; then
+        pass "clear authorized_keys backs up then empties file"
+    else
+        fail "clear authorized_keys backs up then empties file"
     fi
     clear_test_user
     rm -rf "$tmp"
@@ -465,10 +586,22 @@ test_menu_output() {
     tmp=$(make_test_dir)
     show_menu > "$tmp/menu"
     if grep -q "SSH 密钥登录配置" "$tmp/menu" &&
-        grep -q "请选择 \[1-5\]" "$tmp/menu"; then
+        grep -q "5. 退出" "$tmp/menu"; then
         pass "no-arg menu function"
     else
         fail "no-arg menu function"
+    fi
+    rm -rf "$tmp"
+}
+
+test_restore_authorized_keys_message() {
+    tmp=$(make_test_dir)
+    show_authorized_keys_summary "$tmp/missing" > "$tmp/out" 2>&1
+    info "authorized_keys 已恢复为备份时的内容；这不是清空 authorized_keys；如果仍有公钥行，说明备份中本来就有这些公钥。" >> "$tmp/out"
+    if grep -q "不是清空 authorized_keys" "$tmp/out"; then
+        pass "authorized_keys restore explains it is not clear"
+    else
+        fail "authorized_keys restore explains it is not clear"
     fi
     rm -rf "$tmp"
 }
@@ -528,6 +661,7 @@ test_no_forbidden_features() {
     fi
 }
 
+test_ask_prompt_format
 test_github_username_validation
 test_github_placeholder_rejected
 test_github_empty_hint
@@ -543,7 +677,11 @@ test_sshd_config_permit_root
 test_sshd_t_failure_restores_backup
 test_restart_failure_restores_backup
 test_restore_latest_sshd_config_backup
+test_restore_sshd_shows_effective_config
 test_restore_latest_authorized_keys_backup
+test_restore_list_reverse_order
+test_clear_authorized_keys_requires_yes
+test_clear_authorized_keys_backup_and_empty
 test_gen_without_ssh_keygen_fails
 test_gen_mock_ed25519
 test_cli_github_parsing
@@ -553,6 +691,7 @@ test_cli_status_parsing
 test_menu_output
 test_color_output
 test_status_output
+test_restore_authorized_keys_message
 test_no_forbidden_features
 
 if [ "$FAIL_COUNT" -gt 0 ]; then
