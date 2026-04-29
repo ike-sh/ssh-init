@@ -43,6 +43,25 @@ die() {
     exit 1
 }
 
+print_blank() {
+    printf '\n'
+}
+
+print_line() {
+    printf '%s\n' "============================================================"
+}
+
+print_section_title() {
+    title="$1"
+    print_line
+    printf ' %s\n' "$title"
+    print_line
+}
+
+print_section_end() {
+    print_line
+}
+
 ask_prompt() {
     prompt="$1"
     printf '%s ' "$prompt"
@@ -365,6 +384,8 @@ confirm_yes() {
 
 github_mode() {
     github_user="$1"
+    print_blank
+    print_section_title "从 GitHub 导入公钥"
     if [ -z "$github_user" ]; then
         error "GitHub 用户名不能为空。"
         return 1
@@ -423,9 +444,11 @@ generate_ed25519_key_pair() {
 
 print_generated_private_key() {
     [ -f "$GENERATED_PRIVATE_KEY_FILE" ] || die "临时私钥不存在，无法打印。"
-    printf '\n%s\n' "==================== 请复制保存以下私钥 ===================="
+    print_blank
+    print_section_title "请复制保存以下私钥"
     cat "$GENERATED_PRIVATE_KEY_FILE"
-    printf '%s\n\n' "==================== 私钥结束 ===================="
+    print_section_title "私钥结束"
+    print_blank
     info "请把私钥复制保存到本地电脑。"
     info "Windows 可保存为 C:\\Users\\你的用户名\\.ssh\\id_ed25519_SERVER"
     info "Linux/macOS 可保存为 ~/.ssh/id_ed25519_SERVER"
@@ -435,6 +458,8 @@ print_generated_private_key() {
 }
 
 gen_mode() {
+    print_blank
+    print_section_title "在服务器生成 Ed25519 密钥"
     warn "此模式会在服务器临时生成私钥，并打印到终端。"
     warn "请只在可信服务器和可信终端使用。"
     warn "复制保存私钥后，服务器临时私钥会被删除。"
@@ -603,25 +628,29 @@ list_matching_files_reverse() {
 }
 
 list_backups() {
-    info "恢复最新备份表示恢复到脚本上次修改前的状态。"
-    info "authorized_keys 恢复不是清空，而是恢复备份文件内容。"
-    info "恢复后仍可能存在已有公钥，这是正常现象。"
-    info "可用 sshd_config 备份："
+    printf '%s\n' "[说明]"
+    printf '%s\n' "恢复最新备份表示恢复到脚本上次修改前的状态。"
+    printf '%s\n' "authorized_keys 恢复不是清空，而是恢复备份文件内容。"
+    printf '%s\n\n' "authorized_keys 恢复后仍可能存在已有公钥，这是正常现象。"
+
+    printf '%s\n' "[可用 sshd_config 备份]"
     files=$(list_matching_files_reverse "$SSH_CONFIG.bak.*")
     if [ -n "$files" ]; then
         printf '%s\n' "$files" | awk '{print NR ") " $0}'
     else
         printf '%s\n' "(无)"
     fi
+    print_blank
 
     auth_file=$(current_auth_file)
-    info "可用 authorized_keys 备份："
+    printf '%s\n' "[可用 authorized_keys 备份]"
     files=$(list_matching_files_reverse "$auth_file.bak.*")
     if [ -n "$files" ]; then
         printf '%s\n' "$files" | awk '{print NR ") " $0}'
     else
         printf '%s\n' "(无)"
     fi
+    print_blank
 }
 
 show_effective_ssh_config() {
@@ -765,7 +794,10 @@ clear_authorized_keys_interactive() {
 }
 
 restore_menu() {
+    print_blank
+    print_section_title "恢复 SSH 配置备份"
     list_backups
+    printf '%s\n' "[操作]"
     cat <<'EOF'
 1) 恢复最新 sshd_config 备份
 2) 恢复最新 authorized_keys 备份
@@ -810,8 +842,14 @@ show_status() {
     user=$(current_user)
     home=$(home_dir_for_user "$user")
     auth_file="$home/.ssh/authorized_keys"
+    print_blank
+    print_section_title "当前 SSH 登录配置"
+    printf '%s\n' "[用户信息]"
     printf '%s\n' "当前用户: $user"
     printf '%s\n' "HOME: $home"
+    print_blank
+
+    printf '%s\n' "[密钥文件]"
     if [ -d "$home/.ssh" ]; then
         # shellcheck disable=SC2012
         printf '%s\n' ".ssh 权限: $(ls -ld "$home/.ssh" | awk '{print $1}')"
@@ -820,28 +858,39 @@ show_status() {
     fi
     if [ -f "$auth_file" ]; then
         # shellcheck disable=SC2012
-        printf '%s\n' "authorized_keys: 存在，权限 $(ls -l "$auth_file" | awk '{print $1}')，行数 $(wc -l < "$auth_file" | awk '{print $1}')"
+        printf '%s\n' "authorized_keys: 存在"
+        # shellcheck disable=SC2012
+        printf '%s\n' "authorized_keys 权限: $(ls -l "$auth_file" | awk '{print $1}')"
+        printf '%s\n' "authorized_keys 行数: $(wc -l < "$auth_file" | awk '{print $1}')"
     else
         printf '%s\n' "authorized_keys 不存在"
     fi
+    print_blank
+
+    printf '%s\n' "[SSH 生效配置]"
     show_effective_ssh_config
+    print_blank
+
+    printf '%s\n' "[监听端口]"
     if command -v ss >/dev/null 2>&1; then
         ss -ltnp 2>/dev/null | grep sshd || true
     elif command -v netstat >/dev/null 2>&1; then
         netstat -ltnp 2>/dev/null | grep sshd || true
     fi
+    print_section_end
 }
 
 show_menu() {
+    print_blank
+    print_section_title "SSH 密钥登录配置工具"
     cat <<'MENU'
-================ SSH 密钥登录配置工具 ================
-1. 从 GitHub 导入公钥并禁用密码登录
-2. 在服务器生成 Ed25519 密钥并禁用密码登录
-3. 恢复 SSH 配置备份
-4. 查看当前 SSH 登录配置
-5. 退出
-====================================================
+  1. 从 GitHub 导入公钥并禁用密码登录
+  2. 在服务器生成 Ed25519 密钥并禁用密码登录
+  3. 恢复 SSH 配置备份
+  4. 查看当前 SSH 登录配置
+  5. 退出
 MENU
+    print_section_end
 }
 
 interactive_main() {
@@ -883,14 +932,15 @@ interactive_main() {
 }
 
 final_reminder() {
+    print_blank
+    print_section_title "配置完成"
     cat <<'EOF'
-================ 配置完成 ================
 请不要立即关闭当前终端。
 请新开一个终端测试密钥登录是否成功。
 确认可以用私钥登录后，再关闭当前窗口。
 如果无法登录，请通过云厂商 VNC/Console 恢复 SSH 配置。
-=========================================
 EOF
+    print_section_end
 }
 
 usage() {
