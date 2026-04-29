@@ -15,6 +15,7 @@ AUTHORIZED_KEYS_FILE=""
 CLI_MODE=""
 CLI_GITHUB_USER=""
 ASK_REPLY=""
+LOCAL_SSH_DIR=""
 
 BLUE=$(printf '\033[34m')
 GREEN=$(printf '\033[32m')
@@ -167,6 +168,9 @@ set_owner() {
     path="$1"
     user="$2"
     if [ "${IKE_TEST_MODE:-0}" = "1" ]; then
+        return 0
+    fi
+    if [ "$(current_uid)" != "0" ]; then
         return 0
     fi
     chown "$user" "$path"
@@ -359,6 +363,9 @@ print_github_empty_hint() {
     printf '%s\n' "1. GitHub 用户名是否正确"
     printf '%s\n' "2. 该用户是否已在 GitHub Settings -> SSH and GPG keys 添加 Authentication Key"
     printf '%s\n' "3. 浏览器访问 https://github.com/$github_user.keys 是否能看到 ssh-ed25519 / ssh-rsa 开头的公钥"
+    printf '%s\n' "如果你还没有本地公钥，可以先返回主菜单选择："
+    printf '%s\n' "4. 生成新的本机 Ed25519 密钥"
+    printf '%s\n' "然后把输出的公钥复制到 GitHub，再回来选择 1 导入。"
 }
 
 print_execution_summary() {
@@ -374,6 +381,177 @@ print_execution_summary() {
     printf '%s\n' "将修改: $SSH_CONFIG"
     printf '%s\n' "将禁用密码登录: 是"
     printf '%s\n' "将保留 root 密钥登录: PermitRootLogin prohibit-password"
+}
+
+prepare_local_ssh_dir() {
+    user=$(current_user)
+    uid=$(current_uid)
+    home=$(home_dir_for_user "$user")
+    [ -n "$home" ] || die "无法确定当前用户 HOME。"
+    [ "$home" != "/" ] || die "当前用户 HOME 异常。"
+    ! is_symlink_path "$home" || die "当前用户 HOME 不能是 symlink。"
+    [ -d "$home" ] || die "当前用户 HOME 不存在: $home"
+    home_owner=$(owner_uid "$home")
+    if [ -n "$home_owner" ] && [ "$home_owner" != "$uid" ]; then
+        die "当前用户 HOME owner 异常。"
+    fi
+
+    LOCAL_SSH_DIR="$home/.ssh"
+    ! is_symlink_path "$LOCAL_SSH_DIR" || die ".ssh 不能是 symlink。"
+    if [ -e "$LOCAL_SSH_DIR" ] && [ ! -d "$LOCAL_SSH_DIR" ]; then
+        die ".ssh 不是目录。"
+    fi
+    if [ ! -d "$LOCAL_SSH_DIR" ]; then
+        mkdir "$LOCAL_SSH_DIR" || die "无法创建 ~/.ssh。"
+    fi
+    set_mode 700 "$LOCAL_SSH_DIR" || die "无法设置 ~/.ssh 权限。"
+    set_owner "$LOCAL_SSH_DIR" "$user" || die "无法设置 ~/.ssh owner。"
+}
+
+print_public_key_block() {
+    public_file="$1"
+    title="$2"
+    [ -f "$public_file" ] || die "公钥文件不存在: $public_file"
+    print_blank
+    print_section_title "$title"
+    cat "$public_file"
+    print_section_end
+}
+
+print_private_key_block() {
+    private_file="$1"
+    [ -f "$private_file" ] || die "私钥文件不存在: $private_file"
+    print_blank
+    print_section_title "请复制保存以下私钥"
+    cat "$private_file"
+    print_section_title "私钥结束"
+}
+
+maybe_show_private_key_file() {
+    private_file="$1"
+    ask_prompt "是否显示私钥内容？输入 SHOW 继续:" || return 0
+    if [ "$ASK_REPLY" = "SHOW" ]; then
+        print_private_key_block "$private_file"
+    fi
+    return 0
+}
+
+show_local_keys() {
+    user=$(current_user)
+    home=$(home_dir_for_user "$user")
+    ssh_dir="$home/.ssh"
+    found=0
+    private_found=0
+
+    print_blank
+    print_section_title "查看本机已有 SSH 密钥"
+    printf '%s\n' "[说明]"
+    printf '%s\n' "本机指当前运行脚本的服务器。"
+    printf '%s\n\n' "私钥不要上传 GitHub，不要发给别人；FinalShell 导入的是私钥文件。"
+
+    printf '%s\n' "[密钥文件]"
+    for name in id_ed25519 id_ed25519.pub id_rsa id_rsa.pub; do
+        file="$ssh_dir/$name"
+        if [ -f "$file" ]; then
+            found=1
+            printf '%s\n' "存在: $file"
+        else
+            printf '%s\n' "不存在: $file"
+        fi
+    done
+
+    for pub in "$ssh_dir/id_ed25519.pub" "$ssh_dir/id_rsa.pub"; do
+        if [ -f "$pub" ]; then
+            print_blank
+            print_section_title "本机公钥信息"
+            printf '%s\n' "公钥文件: $pub"
+            cat "$pub"
+            print_section_end
+        fi
+    done
+
+    for private in "$ssh_dir/id_ed25519" "$ssh_dir/id_rsa"; do
+        if [ -f "$private" ]; then
+            private_found=1
+            print_blank
+            printf '%s\n' "私钥文件: $private"
+            printf '%s\n' "注意：私钥不要上传 GitHub，不要发给别人。"
+            printf '%s\n' "FinalShell 导入的是私钥文件。"
+        fi
+    done
+
+    if [ "$found" -eq 0 ]; then
+        warn "未发现常见 SSH 密钥，可选择菜单 4 生成新的 Ed25519 密钥。"
+    fi
+
+    if [ "$private_found" -eq 1 ]; then
+        ask_prompt "是否显示私钥内容？输入 SHOW 继续:" || return 0
+        if [ "$ASK_REPLY" = "SHOW" ]; then
+            for private in "$ssh_dir/id_ed25519" "$ssh_dir/id_rsa"; do
+                [ -f "$private" ] || continue
+                print_private_key_block "$private"
+            done
+        fi
+    fi
+}
+
+backup_local_key_file() {
+    file="$1"
+    stamp="$2"
+    if [ -f "$file" ]; then
+        backup="$file.bak.$stamp"
+        cp -p "$file" "$backup" || return 1
+        success "已备份已有密钥: $backup"
+    fi
+}
+
+generate_local_key_only() {
+    print_blank
+    print_section_title "生成新的本机 Ed25519 密钥"
+    if ! command -v ssh-keygen >/dev/null 2>&1; then
+        die "缺少 ssh-keygen，无法生成 SSH 密钥。"
+    fi
+
+    prepare_local_ssh_dir
+    user=$(current_user)
+    private="$LOCAL_SSH_DIR/id_ed25519"
+    public="$private.pub"
+
+    ! is_symlink_path "$private" || die "私钥文件不能是 symlink: $private"
+    ! is_symlink_path "$public" || die "公钥文件不能是 symlink: $public"
+
+    if [ -e "$private" ] || [ -e "$public" ]; then
+        warn "已存在本机 Ed25519 密钥。"
+        printf '%s\n' "私钥文件: $private"
+        printf '%s\n' "公钥文件: $public"
+        ask_prompt "确认覆盖？输入 YES 继续:" || return 1
+        if [ "$ASK_REPLY" != "YES" ]; then
+            warn "已取消生成，不覆盖已有密钥。"
+            return 1
+        fi
+        stamp=$(timestamp)
+        backup_local_key_file "$private" "$stamp" || die "备份已有私钥失败。"
+        backup_local_key_file "$public" "$stamp" || die "备份已有公钥失败。"
+        safe_rm_f "$private" || die "删除旧私钥失败。"
+        safe_rm_f "$public" || die "删除旧公钥失败。"
+    fi
+
+    host=$(hostname 2>/dev/null || printf '%s' "server")
+    info "正在生成本机 Ed25519 密钥..."
+    ssh-keygen -t ed25519 -C "ssh-init-generated@$host" -f "$private" -N "" >/dev/null 2>&1 || die "生成 SSH 密钥失败。"
+    set_mode 600 "$private" || die "无法设置私钥权限。"
+    set_mode 644 "$public" || die "无法设置公钥权限。"
+    set_owner "$private" "$user" || die "无法设置私钥 owner。"
+    set_owner "$public" "$user" || die "无法设置公钥 owner。"
+    success "本机 Ed25519 密钥已生成。"
+
+    print_public_key_block "$public" "请复制以下公钥到 GitHub"
+    info "私钥文件: $private"
+    info "FinalShell 导入这个私钥文件。"
+    info "GitHub 只能粘贴公钥，不能粘贴私钥。"
+    info "GitHub 添加路径: Settings -> SSH and GPG keys -> New SSH key -> Authentication Key"
+    info "如果你要复制私钥到本地，请执行菜单 3 并输入 SHOW 查看私钥。"
+    maybe_show_private_key_file "$private"
 }
 
 confirm_yes() {
@@ -442,12 +620,19 @@ generate_ed25519_key_pair() {
     chmod 600 "$GENERATED_PUBLIC_KEY_FILE" 2>/dev/null || true
 }
 
+print_generated_public_key() {
+    [ -f "$GENERATED_PUBLIC_KEY_FILE" ] || die "临时公钥不存在，无法打印。"
+    print_public_key_block "$GENERATED_PUBLIC_KEY_FILE" "请复制以下公钥到 GitHub"
+    info "公钥可以放 GitHub。"
+    info "私钥必须保存到本地。"
+    info "该公钥已自动写入当前用户 authorized_keys。"
+    info "密码登录已禁用。"
+}
+
 print_generated_private_key() {
     [ -f "$GENERATED_PRIVATE_KEY_FILE" ] || die "临时私钥不存在，无法打印。"
     print_blank
-    print_section_title "请复制保存以下私钥"
-    cat "$GENERATED_PRIVATE_KEY_FILE"
-    print_section_title "私钥结束"
+    print_private_key_block "$GENERATED_PRIVATE_KEY_FILE"
     print_blank
     info "请把私钥复制保存到本地电脑。"
     info "Windows 可保存为 C:\\Users\\你的用户名\\.ssh\\id_ed25519_SERVER"
@@ -472,6 +657,7 @@ gen_mode() {
     [ "$count" -gt 0 ] || die "生成的公钥格式无效。"
     append_keys_to_authorized_keys "$valid_file"
     harden_ssh_config
+    print_generated_public_key
     print_generated_private_key
     final_reminder
 }
@@ -885,10 +1071,12 @@ show_menu() {
     print_section_title "SSH 密钥登录配置工具"
     cat <<'MENU'
   1. 从 GitHub 导入公钥并禁用密码登录
-  2. 在服务器生成 Ed25519 密钥并禁用密码登录
-  3. 恢复 SSH 配置备份
-  4. 查看当前 SSH 登录配置
-  5. 退出
+  2. 在服务器生成 Ed25519 密钥并配置登录
+  3. 查看本机已有 SSH 密钥
+  4. 生成新的本机 Ed25519 密钥
+  5. 恢复 SSH 配置备份
+  6. 查看当前 SSH 登录配置
+  7. 退出
 MENU
     print_section_end
 }
@@ -896,7 +1084,7 @@ MENU
 interactive_main() {
     while :; do
         show_menu
-        ask_prompt "请选择 [1-5]:" || return 0
+        ask_prompt "请选择 [1-7]:" || return 0
         choice=$ASK_REPLY
         case "$choice" in
             1)
@@ -914,13 +1102,19 @@ interactive_main() {
                 fi
                 ;;
             3)
+                show_local_keys
+                ;;
+            4)
+                generate_local_key_only
+                ;;
+            5)
                 require_root
                 restore_menu || true
                 ;;
-            4)
+            6)
                 show_status
                 ;;
-            5)
+            7)
                 info "已退出。"
                 return 0
                 ;;
@@ -949,6 +1143,8 @@ usage() {
   sh init.sh
   sh init.sh github GitHubUser
   sh init.sh gen
+  sh init.sh keys
+  sh init.sh keygen
   sh init.sh restore
   sh init.sh status
 EOF
@@ -971,6 +1167,14 @@ parse_cli_args() {
         gen)
             [ "$#" -eq 1 ] || return 1
             CLI_MODE="gen"
+            ;;
+        keys)
+            [ "$#" -eq 1 ] || return 1
+            CLI_MODE="keys"
+            ;;
+        keygen)
+            [ "$#" -eq 1 ] || return 1
+            CLI_MODE="keygen"
             ;;
         restore)
             [ "$#" -eq 1 ] || return 1
@@ -1007,6 +1211,12 @@ main() {
         gen)
             require_root
             gen_mode
+            ;;
+        keys)
+            show_local_keys
+            ;;
+        keygen)
+            generate_local_key_only
             ;;
         restore)
             require_root

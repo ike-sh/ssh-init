@@ -103,7 +103,8 @@ test_github_empty_hint() {
     print_github_empty_hint "empty-user" > "$tmp/out" 2>&1
     if grep -q "未获取到 GitHub 公钥" "$tmp/out" &&
         grep -q "https://github.com/empty-user.keys" "$tmp/out" &&
-        grep -q "Authentication Key" "$tmp/out"; then
+        grep -q "Authentication Key" "$tmp/out" &&
+        grep -q "4. 生成新的本机 Ed25519 密钥" "$tmp/out"; then
         pass "GitHub .keys empty friendly hint"
     else
         fail "GitHub .keys empty friendly hint"
@@ -500,6 +501,177 @@ test_clear_authorized_keys_backup_and_empty() {
     rm -rf "$tmp"
 }
 
+test_show_local_keys_empty() {
+    tmp=$(make_test_dir)
+    setup_home "$tmp"
+    show_local_keys < /dev/null > "$tmp/out" 2>&1
+    if grep -q "未发现常见 SSH 密钥" "$tmp/out" &&
+        grep -q "菜单 4" "$tmp/out"; then
+        pass "show_local_keys suggests menu 4 when empty"
+    else
+        fail "show_local_keys suggests menu 4 when empty"
+    fi
+    clear_test_user
+    rm -rf "$tmp"
+}
+
+test_show_local_keys_prints_public_key() {
+    tmp=$(make_test_dir)
+    setup_home "$tmp"
+    mkdir -p "$IKE_TEST_HOME/.ssh"
+    printf '%s\n' "$VALID_KEY" > "$IKE_TEST_HOME/.ssh/id_ed25519.pub"
+    show_local_keys < /dev/null > "$tmp/out" 2>&1
+    if grep -q "本机公钥信息" "$tmp/out" &&
+        grep -Fxq "$VALID_KEY" "$tmp/out"; then
+        pass "show_local_keys prints public key"
+    else
+        fail "show_local_keys prints public key"
+    fi
+    clear_test_user
+    rm -rf "$tmp"
+}
+
+test_show_local_keys_hides_private_by_default() {
+    tmp=$(make_test_dir)
+    setup_home "$tmp"
+    mkdir -p "$IKE_TEST_HOME/.ssh"
+    printf '%s\n' "-----BEGIN OPENSSH PRIVATE KEY-----" "secret" "-----END OPENSSH PRIVATE KEY-----" > "$IKE_TEST_HOME/.ssh/id_ed25519"
+    show_local_keys < /dev/null > "$tmp/out" 2>&1
+    if grep -q "私钥文件:" "$tmp/out" &&
+        ! grep -q "BEGIN OPENSSH PRIVATE KEY" "$tmp/out"; then
+        pass "show_local_keys hides private key by default"
+    else
+        fail "show_local_keys hides private key by default"
+    fi
+    clear_test_user
+    rm -rf "$tmp"
+}
+
+test_show_local_keys_prints_private_on_show() {
+    tmp=$(make_test_dir)
+    setup_home "$tmp"
+    mkdir -p "$IKE_TEST_HOME/.ssh"
+    printf '%s\n' "-----BEGIN OPENSSH PRIVATE KEY-----" "secret" "-----END OPENSSH PRIVATE KEY-----" > "$IKE_TEST_HOME/.ssh/id_ed25519"
+    printf '%s\n' "SHOW" > "$tmp/in"
+    show_local_keys < "$tmp/in" > "$tmp/out" 2>&1
+    if grep -q "BEGIN OPENSSH PRIVATE KEY" "$tmp/out"; then
+        pass "show_local_keys prints private key only on SHOW"
+    else
+        fail "show_local_keys prints private key only on SHOW"
+    fi
+    clear_test_user
+    rm -rf "$tmp"
+}
+
+make_mock_ssh_keygen() {
+    bin_dir="$1"
+    cat > "$bin_dir/ssh-keygen" <<'MOCK_KEYGEN'
+#!/bin/sh
+out=""
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "-f" ]; then
+        out="$2"
+        shift 2
+    else
+        shift
+    fi
+done
+printf '%s\n' '-----BEGIN OPENSSH PRIVATE KEY-----' 'mock-local' '-----END OPENSSH PRIVATE KEY-----' > "$out"
+printf '%s\n' 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILocalGeneratedKey1234567890 ssh-init-generated' > "$out.pub"
+MOCK_KEYGEN
+    chmod +x "$bin_dir/ssh-keygen"
+}
+
+test_keygen_existing_requires_yes() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    setup_home "$tmp"
+    mkdir -p "$tmp/bin" "$IKE_TEST_HOME/.ssh"
+    make_mock_ssh_keygen "$tmp/bin"
+    printf '%s\n' "old-private" > "$IKE_TEST_HOME/.ssh/id_ed25519"
+    printf '%s\n' "old-public" > "$IKE_TEST_HOME/.ssh/id_ed25519.pub"
+    printf '%s\n' "no" > "$tmp/in"
+    PATH="$tmp/bin:$PATH"
+    if generate_local_key_only < "$tmp/in" > "$tmp/out" 2>&1; then
+        fail "keygen existing key requires uppercase YES"
+    elif grep -q "old-private" "$IKE_TEST_HOME/.ssh/id_ed25519" &&
+        grep -q "old-public" "$IKE_TEST_HOME/.ssh/id_ed25519.pub"; then
+        pass "keygen existing key requires uppercase YES"
+    else
+        fail "keygen existing key requires uppercase YES"
+    fi
+    PATH=$old_path
+    clear_test_user
+    rm -rf "$tmp"
+}
+
+test_keygen_backup_before_overwrite() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    setup_home "$tmp"
+    mkdir -p "$tmp/bin" "$IKE_TEST_HOME/.ssh"
+    make_mock_ssh_keygen "$tmp/bin"
+    printf '%s\n' "old-private" > "$IKE_TEST_HOME/.ssh/id_ed25519"
+    printf '%s\n' "old-public" > "$IKE_TEST_HOME/.ssh/id_ed25519.pub"
+    printf '%s\n' "YES" > "$tmp/in"
+    PATH="$tmp/bin:$PATH"
+    generate_local_key_only < "$tmp/in" > "$tmp/out" 2>&1
+    private_bak=$(find "$IKE_TEST_HOME/.ssh" -name 'id_ed25519.bak.*' | wc -l | awk '{print $1}')
+    public_bak=$(find "$IKE_TEST_HOME/.ssh" -name 'id_ed25519.pub.bak.*' | wc -l | awk '{print $1}')
+    if [ "$private_bak" = "1" ] && [ "$public_bak" = "1" ]; then
+        pass "keygen creates timestamp backups before overwrite"
+    else
+        fail "keygen creates timestamp backups before overwrite"
+    fi
+    PATH=$old_path
+    clear_test_user
+    rm -rf "$tmp"
+}
+
+test_keygen_generates_files_and_modes() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    setup_home "$tmp"
+    mkdir -p "$tmp/bin"
+    make_mock_ssh_keygen "$tmp/bin"
+    PATH="$tmp/bin:$PATH"
+    generate_local_key_only < /dev/null > "$tmp/out" 2>&1
+    private="$IKE_TEST_HOME/.ssh/id_ed25519"
+    public="$private.pub"
+    if [ -f "$private" ] &&
+        [ -f "$public" ] &&
+        has_mode "$private" 600 &&
+        has_mode "$public" 644 &&
+        grep -q "请复制以下公钥到 GitHub" "$tmp/out"; then
+        pass "keygen generates id_ed25519 files with expected modes"
+    else
+        fail "keygen generates id_ed25519 files with expected modes"
+    fi
+    PATH=$old_path
+    clear_test_user
+    rm -rf "$tmp"
+}
+
+test_gen_mode_public_and_private_blocks() {
+    tmp=$(make_test_dir)
+    GENERATED_PRIVATE_KEY_FILE="$tmp/generated_ed25519"
+    GENERATED_PUBLIC_KEY_FILE="$tmp/generated_ed25519.pub"
+    printf '%s\n' "-----BEGIN OPENSSH PRIVATE KEY-----" "mock" "-----END OPENSSH PRIVATE KEY-----" > "$GENERATED_PRIVATE_KEY_FILE"
+    printf '%s\n' "$VALID_KEY" > "$GENERATED_PUBLIC_KEY_FILE"
+    {
+        print_generated_public_key
+        print_generated_private_key
+    } > "$tmp/out" 2>&1
+    if grep -q "请复制以下公钥到 GitHub" "$tmp/out" &&
+        grep -q "请复制保存以下私钥" "$tmp/out" &&
+        grep -q "该公钥已自动写入当前用户 authorized_keys" "$tmp/out"; then
+        pass "gen mode output includes public and private blocks"
+    else
+        fail "gen mode output includes public and private blocks"
+    fi
+    rm -rf "$tmp"
+}
+
 test_gen_without_ssh_keygen_fails() {
     tmp=$(make_test_dir)
     old_path=$PATH
@@ -564,6 +736,24 @@ test_cli_gen_parsing() {
     fi
 }
 
+test_cli_keys_parsing() {
+    if parse_cli_args keys &&
+        [ "$CLI_MODE" = "keys" ]; then
+        pass "CLI keys subcommand parsing"
+    else
+        fail "CLI keys subcommand parsing"
+    fi
+}
+
+test_cli_keygen_parsing() {
+    if parse_cli_args keygen &&
+        [ "$CLI_MODE" = "keygen" ]; then
+        pass "CLI keygen subcommand parsing"
+    else
+        fail "CLI keygen subcommand parsing"
+    fi
+}
+
 test_cli_restore_parsing() {
     if parse_cli_args restore &&
         [ "$CLI_MODE" = "restore" ]; then
@@ -586,7 +776,8 @@ test_menu_output() {
     tmp=$(make_test_dir)
     show_menu > "$tmp/menu"
     if grep -q "SSH 密钥登录配置" "$tmp/menu" &&
-        grep -q "5. 退出" "$tmp/menu"; then
+        grep -q "7. 退出" "$tmp/menu" &&
+        grep -q "生成新的本机 Ed25519 密钥" "$tmp/menu"; then
         pass "no-arg menu function"
     else
         fail "no-arg menu function"
@@ -682,10 +873,20 @@ test_restore_latest_authorized_keys_backup
 test_restore_list_reverse_order
 test_clear_authorized_keys_requires_yes
 test_clear_authorized_keys_backup_and_empty
+test_show_local_keys_empty
+test_show_local_keys_prints_public_key
+test_show_local_keys_hides_private_by_default
+test_show_local_keys_prints_private_on_show
+test_keygen_existing_requires_yes
+test_keygen_backup_before_overwrite
+test_keygen_generates_files_and_modes
+test_gen_mode_public_and_private_blocks
 test_gen_without_ssh_keygen_fails
 test_gen_mock_ed25519
 test_cli_github_parsing
 test_cli_gen_parsing
+test_cli_keys_parsing
+test_cli_keygen_parsing
 test_cli_restore_parsing
 test_cli_status_parsing
 test_menu_output
