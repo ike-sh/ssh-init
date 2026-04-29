@@ -49,13 +49,36 @@ https://github.com/你的GitHub用户名.keys
 
 GitHub 上保存的是公钥，本地电脑保存的是私钥。脚本只会把有效公钥追加写入当前运行用户的 `~/.ssh/authorized_keys`，不会覆盖已有内容，重复公钥不会重复写入。
 
-添加 GitHub 公钥的路径：
+添加 GitHub 公钥的步骤：
 
-1. 打开 GitHub -> Settings -> SSH and GPG keys
-2. 点击 New SSH key
-3. Key type 选择 Authentication Key
-4. 粘贴你本地电脑上的 `.pub` 公钥内容
-5. 保存后再运行本脚本并选择菜单 `1`
+1. 打开 GitHub SSH Keys 设置页面：
+   <https://github.com/settings/keys>
+2. 点击 New SSH key 或 Add SSH key。
+3. Key type 选择 Authentication Key。
+4. Title 可随便填写，例如 `VPS`、`Home Laptop`、`ssh-init`。
+5. Key 输入框中粘贴“公钥”，不是私钥。
+
+公钥通常长这样：
+
+```text
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... user@device
+```
+
+不要粘贴这种私钥：
+
+```text
+-----BEGIN OPENSSH PRIVATE KEY-----
+...
+-----END OPENSSH PRIVATE KEY-----
+```
+
+添加后可以访问下面地址，检查是否能看到公钥：
+
+```text
+https://github.com/你的用户名.keys
+```
+
+保存后再运行本脚本并选择菜单 `1`。
 
 如果 Windows 连接时报 `Identity file not accessible`，通常表示本地私钥文件不存在、路径写错，或者你把 `.pub` 公钥当成私钥用了。FinalShell 导入的是私钥，不是 `.pub` 公钥。
 

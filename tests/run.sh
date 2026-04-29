@@ -104,10 +104,39 @@ test_github_empty_hint() {
     if grep -q "未获取到 GitHub 公钥" "$tmp/out" &&
         grep -q "https://github.com/empty-user.keys" "$tmp/out" &&
         grep -q "Authentication Key" "$tmp/out" &&
+        grep -q "https://github.com/settings/keys" "$tmp/out" &&
         grep -q "4. 生成新的本机 Ed25519 密钥" "$tmp/out"; then
         pass "GitHub .keys empty friendly hint"
     else
         fail "GitHub .keys empty friendly hint"
+    fi
+    rm -rf "$tmp"
+}
+
+test_github_import_tutorial_output() {
+    tmp=$(make_test_dir)
+    print_github_import_tutorial > "$tmp/out"
+    if grep -q "GitHub 公钥导入说明" "$tmp/out" &&
+        grep -q "https://github.com/settings/keys" "$tmp/out" &&
+        grep -q "Authentication Key" "$tmp/out" &&
+        grep -q "不要粘贴这种私钥" "$tmp/out" &&
+        grep -q "https://github.com/你的用户名.keys" "$tmp/out"; then
+        pass "interactive GitHub tutorial output"
+    else
+        fail "interactive GitHub tutorial output"
+    fi
+    rm -rf "$tmp"
+}
+
+test_github_cli_does_not_print_full_tutorial() {
+    tmp=$(make_test_dir)
+    github_mode "GitHubUser" > "$tmp/out" 2>&1 || true
+    if grep -q "示例占位符" "$tmp/out" &&
+        ! grep -q "GitHub 公钥导入说明" "$tmp/out" &&
+        ! grep -q "不要粘贴这种私钥" "$tmp/out"; then
+        pass "CLI github avoids full tutorial"
+    else
+        fail "CLI github avoids full tutorial"
     fi
     rm -rf "$tmp"
 }
@@ -856,6 +885,8 @@ test_ask_prompt_format
 test_github_username_validation
 test_github_placeholder_rejected
 test_github_empty_hint
+test_github_import_tutorial_output
+test_github_cli_does_not_print_full_tutorial
 test_public_key_validation
 test_github_keys_filtering
 test_authorized_keys_append_dedup_and_permissions

@@ -363,9 +363,55 @@ print_github_empty_hint() {
     printf '%s\n' "1. GitHub 用户名是否正确"
     printf '%s\n' "2. 该用户是否已在 GitHub Settings -> SSH and GPG keys 添加 Authentication Key"
     printf '%s\n' "3. 浏览器访问 https://github.com/$github_user.keys 是否能看到 ssh-ed25519 / ssh-rsa 开头的公钥"
+    printf '%s\n' "4. 请确认你已经把公钥添加到 https://github.com/settings/keys"
+    printf '%s\n' "5. 并且 Key type 选择 Authentication Key。"
     printf '%s\n' "如果你还没有本地公钥，可以先返回主菜单选择："
     printf '%s\n' "4. 生成新的本机 Ed25519 密钥"
     printf '%s\n' "然后把输出的公钥复制到 GitHub，再回来选择 1 导入。"
+}
+
+print_github_import_tutorial() {
+    print_blank
+    print_section_title "GitHub 公钥导入说明"
+    cat <<'EOF'
+
+本功能会从 GitHub 拉取你的公开 SSH 公钥，并写入当前用户的：
+~/.ssh/authorized_keys
+
+操作前，请确保你已经在 GitHub 账户中添加了 SSH 公钥：
+
+1. 打开 GitHub SSH Keys 设置页面：
+   https://github.com/settings/keys
+
+2. 点击 New SSH key 或 Add SSH key
+
+3. Key type 选择：
+   Authentication Key
+
+4. Title 可随便填写，例如：
+   VPS
+   Home Laptop
+   ssh-init
+
+5. Key 输入框中粘贴“公钥”，不是私钥。
+   公钥通常长这样：
+   ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... user@device
+
+6. 不要粘贴这种私钥：
+   -----BEGIN OPENSSH PRIVATE KEY-----
+   ...
+   -----END OPENSSH PRIVATE KEY-----
+
+7. 添加完成后，GitHub 会公开你的公钥地址：
+   https://github.com/你的用户名.keys
+
+如果你还没有公钥，可以先返回主菜单，选择：
+4. 生成新的本机 Ed25519 密钥
+
+然后复制输出的公钥到 GitHub，再回来选择 1 导入。
+
+EOF
+    print_section_end
 }
 
 print_execution_summary() {
@@ -1089,7 +1135,8 @@ interactive_main() {
         case "$choice" in
             1)
                 require_root
-                ask_prompt "请输入 GitHub 用户名:" || return 0
+                print_github_import_tutorial
+                ask_prompt "请输入 GitHub 用户名（username，不含 @）:" || return 0
                 github_user=$ASK_REPLY
                 if github_mode "$github_user"; then
                     return 0
