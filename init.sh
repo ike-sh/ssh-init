@@ -5,8 +5,8 @@
 
 set -u
 
-ALLOWED_GH_USERS=${ALLOWED_GH_USERS:-"ike666888 ike-sh"}
-DEFAULT_USER=${DEFAULT_USER:-deploy}
+ALLOWED_GH_USERS=${ALLOWED_GH_USERS:-}
+DEFAULT_USER=${DEFAULT_USER:-root}
 DEFAULT_PORT=${DEFAULT_PORT:-2222}
 
 BACKUP_ROOT=${BACKUP_ROOT:-/var/backups/ike-ssh-init}
@@ -22,6 +22,8 @@ BLOCK_END="# END IKE-SSH-INIT MANAGED BLOCK"
 TMP_DIR=""
 BACKUP_DIR=""
 VALID_KEYS_FILE=""
+GENERATED_PRIVATE_KEY_FILE=""
+GENERATED_PUBLIC_KEY_FILE=""
 
 info() {
     printf '%s\n' "$*"
@@ -39,7 +41,7 @@ die() {
 cleanup_tmp() {
     if [ -n "${TMP_DIR:-}" ] && [ -d "$TMP_DIR" ]; then
         case "$TMP_DIR" in
-            /tmp/ike-ssh-init.*)
+            */ike-ssh-init.*)
                 rm -rf "$TMP_DIR"
                 ;;
         esac
@@ -81,6 +83,9 @@ init_defaults() {
     SSH_PORT="$DEFAULT_PORT"
     KEY_RAW=""
     KEY_GH=""
+    GEN_KEY=0
+    GENERATED_PRIVATE_KEY_FILE=""
+    GENERATED_PUBLIC_KEY_FILE=""
     STRICT_MODE=0
     YES_MODE=0
     DRY_RUN=0
@@ -99,8 +104,9 @@ usage() {
   sh init.sh [options]
 
 支持参数:
-  --user=deploy
+  --user=root
   --port=2222
+  --gen-key
   --key-raw='ssh-ed25519 AAAA...'
   --key-gh=GitHubUser
   --strict
@@ -130,6 +136,9 @@ parse_args() {
                 ;;
             --key-gh=*)
                 KEY_GH=${arg#*=}
+                ;;
+            --gen-key)
+                GEN_KEY=1
                 ;;
             --strict)
                 STRICT_MODE=1
@@ -238,6 +247,9 @@ is_allowed_gh_user() {
             return 1
             ;;
     esac
+    if [ -z "$ALLOWED_GH_USERS" ]; then
+        return 0
+    fi
     allowed_list=" $ALLOWED_GH_USERS "
     case "$allowed_list" in
         *" $gh_user "*)
@@ -250,8 +262,12 @@ is_allowed_gh_user() {
 }
 
 validate_key_source_args() {
-    if [ -n "$KEY_RAW" ] && [ -n "$KEY_GH" ]; then
-        die "只能选择一种公钥来源: --key-raw 或 --key-gh"
+    key_source_count=0
+    [ "$GEN_KEY" -eq 1 ] && key_source_count=$((key_source_count + 1))
+    [ -n "$KEY_RAW" ] && key_source_count=$((key_source_count + 1))
+    [ -n "$KEY_GH" ] && key_source_count=$((key_source_count + 1))
+    if [ "$key_source_count" -gt 1 ]; then
+        die "只能选择一种密钥来源: --gen-key, --key-raw 或 --key-gh"
     fi
     if [ -n "$KEY_GH" ] && ! is_allowed_gh_user "$KEY_GH"; then
         die "GitHub 用户不在 ALLOWED_GH_USERS 白名单中: $KEY_GH"
@@ -1051,11 +1067,31 @@ configure_firewall() {
     return 0
 }
 
+generate_ed25519_key_pair() {
+    if ! command -v ssh-keygen >/dev/null 2>&1; then
+        die "缺少 ssh-keygen，无法生成 SSH 密钥"
+    fi
+    if [ -z "${TMP_DIR:-}" ]; then
+        make_tmp_dir
+    fi
+    GENERATED_PRIVATE_KEY_FILE="$TMP_DIR/generated_ed25519"
+    GENERATED_PUBLIC_KEY_FILE="$GENERATED_PRIVATE_KEY_FILE.pub"
+    safe_rm_f "$GENERATED_PRIVATE_KEY_FILE" || return 1
+    safe_rm_f "$GENERATED_PUBLIC_KEY_FILE" || return 1
+    ssh-keygen -q -t ed25519 -N "" -f "$GENERATED_PRIVATE_KEY_FILE" -C "ike-ssh-init-generated" >/dev/null 2>&1 || return 1
+    chmod 600 "$GENERATED_PRIVATE_KEY_FILE" 2>/dev/null || true
+    chmod 600 "$GENERATED_PUBLIC_KEY_FILE" 2>/dev/null || true
+    return 0
+}
+
 collect_public_keys() {
     raw_file=$(make_tmp_file "keys.raw")
     valid_file=$(make_tmp_file "keys.valid")
 
-    if [ -n "$KEY_RAW" ]; then
+    if [ "$GEN_KEY" -eq 1 ]; then
+        generate_ed25519_key_pair || return 1
+        raw_file="$GENERATED_PUBLIC_KEY_FILE"
+    elif [ -n "$KEY_RAW" ]; then
         printf '%s\n' "$KEY_RAW" > "$raw_file" || return 1
     elif [ -n "$KEY_GH" ]; then
         fetch_github_keys "$KEY_GH" "$raw_file" || return 1
@@ -1081,7 +1117,12 @@ print_plan() {
     info "${prefix}系统检测: $OS_NAME"
     info "${prefix}登录用户: $TARGET_USER"
     info "${prefix}SSH 端口: $SSH_PORT"
-    if [ -n "$KEY_RAW" ]; then
+    if [ "$GEN_KEY" -eq 1 ]; then
+        info "${prefix}公钥来源: 服务器临时生成 ed25519 密钥对 (--gen-key)"
+        if [ "$DRY_RUN" -eq 1 ]; then
+            info "${prefix}将在服务器临时生成 ed25519 密钥对，并在成功后打印私钥。"
+        fi
+    elif [ -n "$KEY_RAW" ]; then
         info "${prefix}公钥来源: --key-raw"
     elif [ -n "$KEY_GH" ]; then
         info "${prefix}公钥来源: GitHub $KEY_GH"
@@ -1115,19 +1156,25 @@ prompt_default() {
 
 interactive_prompts() {
     info "进入中文交互模式。"
-    TARGET_USER=$(prompt_default "登录用户 [deploy]: " "deploy")
+    TARGET_USER=$(prompt_default "登录用户 [root]: " "root")
     SSH_PORT=$(prompt_default "SSH 端口 [2222]: " "2222")
 
     info "公钥来源:"
-    info "  1) GitHub"
-    info "  2) 手动粘贴"
+    info "  1) 服务器临时生成 ed25519 密钥对并打印私钥"
+    info "  2) GitHub"
+    info "  3) 手动粘贴"
     key_choice=$(prompt_default "请选择 [1]: " "1")
     case "$key_choice" in
         1)
-            info "允许的 GitHub 用户白名单: $ALLOWED_GH_USERS"
-            KEY_GH=$(prompt_default "GitHub 用户名: " "")
+            GEN_KEY=1
             ;;
         2)
+            if [ -n "$ALLOWED_GH_USERS" ]; then
+                info "允许的 GitHub 用户白名单: $ALLOWED_GH_USERS"
+            fi
+            KEY_GH=$(prompt_default "GitHub 用户名: " "")
+            ;;
+        3)
             KEY_RAW=$(prompt_default "请粘贴 SSH 公钥: " "")
             ;;
         *)
@@ -1173,11 +1220,42 @@ should_warn_new_user_sudo_password() {
     [ "$USER_CREATED" -eq 1 ] && [ "$SUDO_NOPASSWD" -eq 0 ]
 }
 
+print_generated_private_key() {
+    if [ "$GEN_KEY" -ne 1 ]; then
+        return 0
+    fi
+    if [ -z "$GENERATED_PRIVATE_KEY_FILE" ] || [ ! -f "$GENERATED_PRIVATE_KEY_FILE" ]; then
+        warn "未找到临时私钥文件，无法打印私钥。"
+        return 1
+    fi
+    info ""
+    info "==================== 请复制保存以下私钥 ===================="
+    cat "$GENERATED_PRIVATE_KEY_FILE"
+    info "==================== 私钥结束 ===================="
+    info "请把上方私钥保存到本地电脑。"
+    info "Windows 可保存为: C:\\Users\\你的用户名\\.ssh\\id_ed25519_SERVER"
+    info "Linux/macOS 可保存为: ~/.ssh/id_ed25519_SERVER"
+    info "文件权限建议: chmod 600 ~/.ssh/id_ed25519_SERVER"
+    info "FinalShell 导入的是这段私钥，不是公钥。"
+    safe_rm_f "$GENERATED_PRIVATE_KEY_FILE" || true
+    safe_rm_f "$GENERATED_PUBLIC_KEY_FILE" || true
+    return 0
+}
+
 post_success_message() {
     info ""
     info "================ 完成 ================"
-    info "新 SSH 登录命令:"
-    info "ssh -i ~/.ssh/id_ed25519 -p $SSH_PORT $TARGET_USER@SERVER_IP"
+    if [ "$GEN_KEY" -eq 1 ]; then
+        print_generated_private_key || true
+        info ""
+        info "请使用上方打印的私钥登录。"
+        info "新 SSH 登录命令:"
+        info "ssh -i /path/to/saved_private_key -p $SSH_PORT $TARGET_USER@SERVER_IP"
+        info "FinalShell: 认证方式选 '公钥'，私钥导入刚才保存的私钥文件，用户名 $TARGET_USER，端口 $SSH_PORT。"
+    else
+        info "新 SSH 登录命令:"
+        info "ssh -i ~/.ssh/id_ed25519 -p $SSH_PORT $TARGET_USER@SERVER_IP"
+    fi
     info ""
     info "请不要关闭当前 SSH 窗口。"
     info "请新开终端测试登录。"

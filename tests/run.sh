@@ -9,6 +9,7 @@ export IKE_TEST_MODE
 
 PASS_COUNT=0
 FAIL_COUNT=0
+SKIP_COUNT=0
 VALID_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMockPublicKeyForTestsOnly1234567890 test@example"
 
 pass() {
@@ -19,6 +20,11 @@ pass() {
 fail() {
     FAIL_COUNT=$((FAIL_COUNT + 1))
     printf '%s\n' "not ok - $1" >&2
+}
+
+skip() {
+    SKIP_COUNT=$((SKIP_COUNT + 1))
+    printf '%s\n' "skip - $1"
 }
 
 assert() {
@@ -57,6 +63,31 @@ test_parse_args() {
     assert_eq "parse sudo-nopasswd" "1" "$SUDO_NOPASSWD"
 }
 
+test_default_user_root() {
+    init_defaults
+    assert_eq "default user is root" "root" "$TARGET_USER"
+}
+
+test_parse_gen_key() {
+    init_defaults
+    parse_args --port=22222 --gen-key --strict --yes
+    assert_eq "parse gen-key" "1" "$GEN_KEY"
+}
+
+test_gen_key_mutex() {
+    if (init_defaults; parse_args --gen-key --key-gh=someone >/dev/null 2>&1; validate_key_source_args >/dev/null 2>&1); then
+        fail "gen-key and key-gh are mutually exclusive"
+    else
+        pass "gen-key and key-gh are mutually exclusive"
+    fi
+
+    if (init_defaults; parse_args --gen-key --key-raw="$VALID_KEY" >/dev/null 2>&1; validate_key_source_args >/dev/null 2>&1); then
+        fail "gen-key and key-raw are mutually exclusive"
+    else
+        pass "gen-key and key-raw are mutually exclusive"
+    fi
+}
+
 test_key_validation() {
     if normalize_key_line "$VALID_KEY" >/dev/null; then
         pass "valid public key accepted"
@@ -75,6 +106,65 @@ test_key_validation() {
     else
         pass "invalid key data rejected"
     fi
+}
+
+test_dry_run_gen_key_does_not_generate() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    mkdir -p "$tmp/bin" "$tmp/etc/ssh/sshd_config.d" "$tmp/etc/sudoers.d"
+    cat > "$tmp/bin/ssh-keygen" <<'MOCK_SSH_KEYGEN'
+#!/bin/sh
+printf '%s\n' called >> "$MOCK_SSH_KEYGEN_LOG"
+exit 1
+MOCK_SSH_KEYGEN
+    chmod +x "$tmp/bin/ssh-keygen"
+    PATH="$tmp/bin:$PATH"
+    MOCK_SSH_KEYGEN_LOG="$tmp/ssh-keygen.log"
+    export MOCK_SSH_KEYGEN_LOG
+    SSH_CONFIG="$tmp/etc/ssh/sshd_config"
+    SSH_CONFIG_D="$tmp/etc/ssh/sshd_config.d"
+    SUDOERS_D="$tmp/etc/sudoers.d"
+    SSHD_FRAGMENT="$SSH_CONFIG_D/99-ike-hardening.conf"
+    BACKUP_ROOT="$tmp/backups"
+    printf '%s\n' "Include $SSH_CONFIG_D/*.conf" > "$SSH_CONFIG"
+    IKE_SKIP_ROOT_CHECK=1
+    export IKE_SKIP_ROOT_CHECK
+
+    main --dry-run --port=22222 --gen-key --yes --no-firewall > "$tmp/out" 2>"$tmp/err"
+
+    if grep -q "\[DRY-RUN\].*ed25519" "$tmp/out" && [ ! -f "$MOCK_SSH_KEYGEN_LOG" ] && [ ! -e "$BACKUP_ROOT" ]; then
+        pass "dry-run gen-key does not generate"
+    else
+        fail "dry-run gen-key does not generate"
+    fi
+
+    PATH=$old_path
+    unset MOCK_SSH_KEYGEN_LOG
+    safe_rm_rf "$tmp"
+}
+
+test_gen_key_collects_public_key() {
+    if ! command -v ssh-keygen >/dev/null 2>&1; then
+        skip "gen-key public key enters VALID_KEYS_FILE (ssh-keygen missing)"
+        return 0
+    fi
+
+    tmp=$(make_test_dir)
+    TMP_DIR="$tmp/work"
+    mkdir -p "$TMP_DIR"
+    GEN_KEY=1
+    KEY_RAW=""
+    KEY_GH=""
+
+    if collect_public_keys &&
+        [ -f "$VALID_KEYS_FILE" ] &&
+        grep -q '^ssh-ed25519 ' "$VALID_KEYS_FILE"; then
+        pass "gen-key public key enters VALID_KEYS_FILE"
+    else
+        fail "gen-key public key enters VALID_KEYS_FILE"
+    fi
+
+    safe_rm_rf "$tmp"
 }
 
 test_dry_run_does_not_write() {
@@ -110,11 +200,21 @@ test_latest_backup_dir() {
 }
 
 test_key_gh_whitelist() {
-    if is_allowed_gh_user "ike666888" && ! is_allowed_gh_user "not-allowed"; then
-        pass "key-gh whitelist"
+    old_allowed=$ALLOWED_GH_USERS
+    ALLOWED_GH_USERS=""
+    if is_allowed_gh_user "anyone-ok"; then
+        pass "empty key-gh whitelist allows legal user"
     else
-        fail "key-gh whitelist"
+        fail "empty key-gh whitelist allows legal user"
     fi
+
+    ALLOWED_GH_USERS="ike666888 ike-sh"
+    if is_allowed_gh_user "ike666888" && ! is_allowed_gh_user "not-allowed"; then
+        pass "nonempty key-gh whitelist restricts user"
+    else
+        fail "nonempty key-gh whitelist restricts user"
+    fi
+    ALLOWED_GH_USERS=$old_allowed
 }
 
 test_port_validation() {
@@ -147,6 +247,17 @@ test_sudo_nopasswd_logic() {
     esac
 }
 
+test_root_user_skips_sudoers() {
+    tmp=$(make_test_dir)
+    SUDOERS_D="$tmp/sudoers.d"
+    if configure_sudoers root 1 && [ ! -e "$SUDOERS_D" ]; then
+        pass "root user skips sudoers"
+    else
+        fail "root user skips sudoers"
+    fi
+    safe_rm_rf "$tmp"
+}
+
 test_user_created_prompt_logic() {
     tmp=$(make_test_dir)
     TARGET_USER=deploy
@@ -164,6 +275,54 @@ test_user_created_prompt_logic() {
         pass "USER_CREATED password prompt logic"
     else
         fail "USER_CREATED password prompt logic"
+    fi
+    safe_rm_rf "$tmp"
+}
+
+test_gen_key_private_key_prompt() {
+    tmp=$(make_test_dir)
+    GENERATED_PRIVATE_KEY_FILE="$tmp/generated_ed25519"
+    GENERATED_PUBLIC_KEY_FILE="$tmp/generated_ed25519.pub"
+    GEN_KEY=1
+    TARGET_USER=root
+    SSH_PORT=22222
+    BACKUP_DIR="$tmp/backups/20260101_000000"
+    SUDO_NOPASSWD=0
+    USER_CREATED=0
+    cat > "$GENERATED_PRIVATE_KEY_FILE" <<'MOCK_KEY'
+-----BEGIN OPENSSH PRIVATE KEY-----
+test-private-key
+-----END OPENSSH PRIVATE KEY-----
+MOCK_KEY
+    printf '%s\n' "$VALID_KEY" > "$GENERATED_PUBLIC_KEY_FILE"
+
+    post_success_message > "$tmp/out"
+
+    if grep -q "BEGIN OPENSSH PRIVATE KEY" "$tmp/out" &&
+        grep -q "ssh -i /path/to/saved_private_key -p 22222 root@SERVER_IP" "$tmp/out" &&
+        [ ! -e "$GENERATED_PRIVATE_KEY_FILE" ] &&
+        [ ! -e "$GENERATED_PUBLIC_KEY_FILE" ]; then
+        pass "gen-key private key prompt"
+    else
+        fail "gen-key private key prompt"
+    fi
+    safe_rm_rf "$tmp"
+}
+
+test_success_prompt_root_port_for_existing_key() {
+    tmp=$(make_test_dir)
+    GEN_KEY=0
+    TARGET_USER=root
+    SSH_PORT=22222
+    BACKUP_DIR="$tmp/backups/20260101_000000"
+    SUDO_NOPASSWD=0
+    USER_CREATED=0
+    post_success_message > "$tmp/out"
+
+    if grep -q "ssh -i ~/.ssh/id_ed25519 -p 22222 root@SERVER_IP" "$tmp/out"; then
+        pass "success prompt root and port"
+    else
+        fail "success prompt root and port"
     fi
     safe_rm_rf "$tmp"
 }
@@ -402,14 +561,22 @@ test_sshd_config_d_write() {
     safe_rm_rf "$tmp"
 }
 
+test_default_user_root
 test_parse_args
+test_parse_gen_key
+test_gen_key_mutex
 test_key_validation
+test_dry_run_gen_key_does_not_generate
+test_gen_key_collects_public_key
 test_dry_run_does_not_write
 test_latest_backup_dir
 test_key_gh_whitelist
 test_port_validation
 test_sudo_nopasswd_logic
+test_root_user_skips_sudoers
 test_user_created_prompt_logic
+test_gen_key_private_key_prompt
+test_success_prompt_root_port_for_existing_key
 test_authorized_keys_rejects_bad_home_owner
 test_preflight_rejects_mainthread_port
 test_preflight_allows_free_port
@@ -425,4 +592,4 @@ if [ "$FAIL_COUNT" -gt 0 ]; then
     exit 1
 fi
 
-printf '%s\n' "$PASS_COUNT test(s) passed"
+printf '%s\n' "$PASS_COUNT test(s) passed, $SKIP_COUNT test(s) skipped"

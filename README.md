@@ -2,16 +2,102 @@
 
 `ssh-init` 只做一件事：Linux VPS 的 SSH 密钥登录初始化和安全加固。
 
-它不会配置 BBR，不会执行系统 `update/upgrade`，不会安装 Docker，不会建站、申请 SSL、配置反代、WARP、DD 系统，也不是大菜单工具箱。脚本目标是简单、可审计、可回滚，适合长期在新 VPS 上重复使用。
+它不会配置 BBR，不会执行系统 `update/upgrade`，不会安装 Docker，不会建站、申请 SSL、配置反代、WARP、DD 系统，也不是大菜单工具箱。
 
-## 安全提醒
+## 默认模式
 
-- 私钥永远只保存在你的本地电脑，不要上传到服务器。
-- GitHub 只保存公钥，例如 `id_ed25519.pub` 的内容。
-- 运行前先在云厂商安全组/防火墙放行目标 SSH 端口，例如 `2222/tcp`。
-- 脚本只能自动处理服务器内的 `ufw` 或 `firewalld`，无法自动修改云厂商安全组。
-- 不推荐直接 `curl | sh` 跑主分支。
-- 推荐固定 release 或固定 commit 下载后，先阅读脚本，再执行。
+默认登录用户是 `root`。
+
+脚本会把 SSH 配置为：
+
+```text
+PermitRootLogin prohibit-password
+```
+
+含义是：禁止 root 密码登录，但允许 root 使用私钥登录。
+
+## 推荐用法：服务器生成密钥
+
+推荐让脚本在服务器临时生成一对 `ed25519` 密钥：
+
+```sh
+sh ./init.sh --port=22222 --gen-key --strict --yes --no-firewall
+```
+
+脚本会：
+
+- 在安全临时目录中生成 SSH 密钥对。
+- 把公钥写入目标用户的 `authorized_keys`。
+- SSH 加固成功后，把私钥完整打印到终端。
+- 打印后删除服务器上的临时私钥和公钥文件。
+
+请把终端中这段私钥复制保存到本地电脑。私钥不会写入 README、备份目录或长期保存在服务器上。
+
+## 保存私钥
+
+Windows PowerShell 可保存为：
+
+```powershell
+notepad $env:USERPROFILE\.ssh\id_ed25519_SERVER
+```
+
+把脚本打印的完整私钥粘贴进去，保存后使用：
+
+```powershell
+ssh -i $env:USERPROFILE\.ssh\id_ed25519_SERVER -p 22222 root@SERVER_IP
+```
+
+Linux/macOS 可保存为：
+
+```sh
+mkdir -p ~/.ssh
+vi ~/.ssh/id_ed25519_SERVER
+chmod 600 ~/.ssh/id_ed25519_SERVER
+ssh -i ~/.ssh/id_ed25519_SERVER -p 22222 root@SERVER_IP
+```
+
+FinalShell 使用方式：
+
+- 用户名：`root`
+- 端口：你的 SSH 端口，例如 `22222`
+- 认证方式：选择“公钥”
+- 私钥：导入刚才保存的私钥文件
+- 注意：FinalShell 导入的是私钥，不是公钥
+
+## 可选方式：GitHub 公钥
+
+如果你已经把公钥放在 GitHub，也可以使用：
+
+```sh
+sh ./init.sh --port=22222 --key-gh=GitHubUser --strict --yes --no-firewall
+```
+
+`ALLOWED_GH_USERS` 默认是空，表示允许任意合法 GitHub 用户名。你也可以在脚本顶部设置白名单：
+
+```sh
+ALLOWED_GH_USERS="alice bob"
+```
+
+当白名单非空时，`--key-gh` 只允许白名单内的用户。
+
+## 可选方式：手动传入公钥
+
+```sh
+sh ./init.sh \
+  --port=22222 \
+  --key-raw='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... you@example' \
+  --strict \
+  --yes \
+  --no-firewall
+```
+
+## 运行前检查
+
+运行前请先在云厂商安全组/防火墙放行目标 SSH 端口，例如 `22222/tcp`。
+
+脚本只能自动处理服务器内的 `ufw` 或 `firewalld`，无法自动修改云厂商安全组。使用 `--no-firewall` 时，脚本不会修改本机防火墙。
+
+不推荐直接 `curl | sh` 跑主分支。推荐固定 tag、release 或 commit 下载后，先阅读脚本，再执行。
 
 ## 支持系统
 
@@ -26,43 +112,14 @@
 
 脚本使用 POSIX `sh`，入口文件是 `init.sh`。
 
-## Windows 生成 SSH 密钥
-
-在 Windows PowerShell 中执行：
-
-```powershell
-ssh-keygen -t ed25519 -C "your_email@example.com" -f $env:USERPROFILE\.ssh\id_ed25519
-```
-
-生成后：
-
-- 私钥：`%USERPROFILE%\.ssh\id_ed25519`，只留在本地。
-- 公钥：`%USERPROFILE%\.ssh\id_ed25519.pub`，可以复制到 GitHub。
-
-查看公钥：
-
-```powershell
-Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub
-```
-
-## GitHub 添加公钥
-
-1. 打开 GitHub。
-2. 进入 `Settings`。
-3. 进入 `SSH and GPG keys`。
-4. 点击 `New SSH key`。
-5. 粘贴 `id_ed25519.pub` 的内容。
-6. 保存。
-
-注意：只粘贴公钥，永远不要粘贴私钥。
-
 ## 参数
 
 支持：
 
 ```text
---user=deploy
---port=2222
+--user=root
+--port=22222
+--gen-key
 --key-raw='ssh-ed25519 AAAA...'
 --key-gh=GitHubUser
 --strict
@@ -71,6 +128,14 @@ Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub
 --rollback-last
 --no-firewall
 --sudo-nopasswd
+```
+
+三种密钥来源互斥，只能选择一种：
+
+```text
+--gen-key
+--key-gh=GitHubUser
+--key-raw='ssh-ed25519 AAAA...'
 ```
 
 不支持，也不会实现：
@@ -86,77 +151,15 @@ Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub
 --ssl
 ```
 
-`--key-gh` 受 `init.sh` 顶部 `ALLOWED_GH_USERS` 白名单限制，默认示例：
-
-```sh
-ALLOWED_GH_USERS="ike666888 ike-sh"
-```
-
-## 典型用法
-
-先下载固定版本或固定 commit 的 `init.sh`，阅读确认后执行。
-
-手动传入公钥：
-
-```sh
-sh init.sh \
-  --user=deploy \
-  --port=2222 \
-  --key-raw='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... your_email@example.com' \
-  --strict \
-  --yes
-```
-
-从白名单 GitHub 用户导入公钥：
-
-```sh
-sh init.sh \
-  --user=deploy \
-  --port=2222 \
-  --key-gh=ike666888 \
-  --strict \
-  --yes
-```
-
-不修改本机防火墙：
-
-```sh
-sh init.sh \
-  --user=deploy \
-  --port=2222 \
-  --key-gh=ike666888 \
-  --no-firewall \
-  --strict \
-  --yes
-```
-
-仅打印计划，不改系统：
-
-```sh
-sh init.sh --user=deploy --port=2222 --key-gh=ike666888 --dry-run
-```
-
-交互模式：
-
-```sh
-sh init.sh
-```
-
 ## sudo 行为
 
-默认会写入需要密码的 sudo 配置：
+目标用户为 `root` 时，不需要写入 sudoers。
+
+如果使用 `--user=deploy` 等普通用户，默认会写入需要密码的 sudo 配置：
 
 ```text
 deploy ALL=(ALL) ALL
 ```
-
-如果脚本新建了 `deploy` 用户，且你没有使用 `--sudo-nopasswd`，成功提示中会明显提醒：
-
-```sh
-passwd deploy
-```
-
-请先在当前 root 窗口执行该命令，为新建用户设置 sudo 所需密码，然后再验证 `sudo`。脚本不会保存或上传任何密码。
 
 只有显式传入 `--sudo-nopasswd` 时，才会写入：
 
@@ -202,7 +205,7 @@ ClientAliveInterval 300
 ClientAliveCountMax 2
 ```
 
-写入后会执行 `sshd -t` 或 `/usr/sbin/sshd -t` 校验。校验失败、SSH reload/restart 失败都会自动回滚。
+写入后会执行 `sshd -t` 或 `/usr/sbin/sshd -t` 校验，然后优先 restart SSH 服务，并等待新端口确认由 `sshd` 或 SSH banner 监听。失败会自动回滚。
 
 ## 备份与回滚
 
@@ -239,13 +242,13 @@ restore.sh
 如果新 SSH 登录失败，可通过云厂商 VNC/Console 进入服务器后执行：
 
 ```sh
-sh /var/backups/ike-ssh-init/<latest>/restore.sh
+sh /var/backups/ike-ssh-init/<TIMESTAMP>/restore.sh
 ```
 
 也可以自动回滚最近一次备份：
 
 ```sh
-sh init.sh --rollback-last
+sh ./init.sh --rollback-last
 ```
 
 回滚需要 root 权限。如果当前是普通用户，不能执行 `/root/init.sh --rollback-last`。请使用仍然打开的 root 窗口，或者通过云厂商 Console 登录 root 后执行。若普通用户仍有 sudo 权限，也可以执行：
@@ -256,17 +259,16 @@ sudo sh /var/backups/ike-ssh-init/<TIMESTAMP>/restore.sh
 
 ## 成功后请检查
 
-脚本成功后会输出类似：
+脚本成功后会输出登录命令。`--gen-key` 模式示例：
 
 ```sh
-ssh -i ~/.ssh/id_ed25519 -p 2222 deploy@SERVER_IP
+ssh -i /path/to/saved_private_key -p 22222 root@SERVER_IP
 ```
 
 请务必：
 
 - 不要关闭当前 SSH 窗口。
 - 新开终端测试登录。
-- 确认 `sudo` 可用。
 - 确认云厂商安全组已放行目标端口。
 - 确认无法登录时知道如何执行 `restore.sh`。
 
@@ -277,5 +279,3 @@ ssh -i ~/.ssh/id_ed25519 -p 2222 deploy@SERVER_IP
 ```sh
 sh tests/run.sh
 ```
-
-覆盖参数解析、公钥格式、dry-run、rollback-last、GitHub 白名单、端口校验、sudo NOPASSWD 逻辑和 `sshd_config.d` 写入逻辑。
