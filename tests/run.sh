@@ -291,6 +291,176 @@ test_sshd_config_permit_root() {
     rm -rf "$tmp"
 }
 
+test_immutable_detection_with_i() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    mkdir -p "$tmp/bin"
+    file="$tmp/sshd_config"
+    printf '%s\n' "config" > "$file"
+    cat > "$tmp/bin/lsattr" <<'MOCK_LSATTR'
+#!/bin/sh
+printf '%s\n' '----i---------e------- '"$1"
+MOCK_LSATTR
+    chmod +x "$tmp/bin/lsattr"
+    PATH="$tmp/bin:$PATH"
+    if is_immutable_file "$file"; then
+        pass "is_immutable_file detects i attribute"
+    else
+        fail "is_immutable_file detects i attribute"
+    fi
+    PATH=$old_path
+    rm -rf "$tmp"
+}
+
+test_immutable_detection_without_i() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    mkdir -p "$tmp/bin"
+    file="$tmp/sshd_config"
+    printf '%s\n' "config" > "$file"
+    cat > "$tmp/bin/lsattr" <<'MOCK_LSATTR'
+#!/bin/sh
+printf '%s\n' '--------------e------- '"$1"
+MOCK_LSATTR
+    chmod +x "$tmp/bin/lsattr"
+    PATH="$tmp/bin:$PATH"
+    if is_immutable_file "$file"; then
+        fail "is_immutable_file ignores non-immutable file"
+    else
+        pass "is_immutable_file ignores non-immutable file"
+    fi
+    PATH=$old_path
+    rm -rf "$tmp"
+}
+
+test_unlock_immutable_calls_chattr() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    old_flag=$SSHD_CONFIG_WAS_IMMUTABLE
+    mkdir -p "$tmp/bin"
+    file="$tmp/sshd_config"
+    printf '%s\n' "config" > "$file"
+    cat > "$tmp/bin/lsattr" <<'MOCK_LSATTR'
+#!/bin/sh
+printf '%s\n' '----i---------e------- '"$1"
+MOCK_LSATTR
+    cat > "$tmp/bin/chattr" <<'MOCK_CHATTR'
+#!/bin/sh
+printf '%s\n' "$*" >> "$CHATTR_LOG"
+exit 0
+MOCK_CHATTR
+    chmod +x "$tmp/bin/lsattr" "$tmp/bin/chattr"
+    CHATTR_LOG="$tmp/chattr.log"
+    export CHATTR_LOG
+    PATH="$tmp/bin:$PATH"
+    unlock_immutable_if_needed "$file" > "$tmp/out" 2>&1
+    if grep -q -- "-i $file" "$CHATTR_LOG" &&
+        [ "$SSHD_CONFIG_WAS_IMMUTABLE" = "1" ] &&
+        grep -q "不会修改 Port" "$tmp/out"; then
+        pass "unlock immutable calls chattr -i"
+    else
+        fail "unlock immutable calls chattr -i"
+    fi
+    SSHD_CONFIG_WAS_IMMUTABLE=$old_flag
+    PATH=$old_path
+    unset CHATTR_LOG
+    rm -rf "$tmp"
+}
+
+test_relock_only_when_originally_immutable() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    old_flag=$SSHD_CONFIG_WAS_IMMUTABLE
+    mkdir -p "$tmp/bin"
+    file="$tmp/sshd_config"
+    printf '%s\n' "config" > "$file"
+    cat > "$tmp/bin/chattr" <<'MOCK_CHATTR'
+#!/bin/sh
+printf '%s\n' "$*" >> "$CHATTR_LOG"
+exit 0
+MOCK_CHATTR
+    chmod +x "$tmp/bin/chattr"
+    CHATTR_LOG="$tmp/chattr.log"
+    export CHATTR_LOG
+    PATH="$tmp/bin:$PATH"
+    SSHD_CONFIG_WAS_IMMUTABLE=1
+    relock_immutable_if_needed "$file" >/dev/null 2>&1
+    if grep -q -- "+i $file" "$CHATTR_LOG"; then
+        pass "relock immutable calls chattr +i"
+    else
+        fail "relock immutable calls chattr +i"
+    fi
+    : > "$CHATTR_LOG"
+    SSHD_CONFIG_WAS_IMMUTABLE=0
+    relock_immutable_if_needed "$file" >/dev/null 2>&1
+    if [ ! -s "$CHATTR_LOG" ]; then
+        pass "relock skips chattr for non-immutable file"
+    else
+        fail "relock skips chattr for non-immutable file"
+    fi
+    SSHD_CONFIG_WAS_IMMUTABLE=$old_flag
+    PATH=$old_path
+    unset CHATTR_LOG
+    rm -rf "$tmp"
+}
+
+test_sshd_config_writer_does_not_modify_port_or_forbidden_keys() {
+    tmp=$(make_test_dir)
+    in="$tmp/sshd_config"
+    out="$tmp/out"
+    {
+        printf '%s\n' "Port 2222"
+        printf '%s\n' "ListenAddress 0.0.0.0"
+        printf '%s\n' "HostKey /etc/ssh/ssh_host_ed25519_key"
+        printf '%s\n' "AllowUsers root"
+        printf '%s\n' "DenyUsers bad"
+        printf '%s\n' "AuthorizedKeysFile .ssh/authorized_keys"
+        printf '%s\n' "# PasswordAuthentication yes"
+        printf '%s\n' "Match User deploy"
+        printf '%s\n' "    PasswordAuthentication yes"
+    } > "$in"
+    write_hardened_sshd_config "$in" "$out"
+    if grep -q '^Port 2222$' "$out" &&
+        grep -q '^ListenAddress 0.0.0.0$' "$out" &&
+        grep -q '^HostKey /etc/ssh/ssh_host_ed25519_key$' "$out" &&
+        grep -q '^AllowUsers root$' "$out" &&
+        grep -q '^DenyUsers bad$' "$out" &&
+        grep -q '^AuthorizedKeysFile .ssh/authorized_keys$' "$out" &&
+        grep -q '^Match User deploy$' "$out" &&
+        grep -q '^    PasswordAuthentication yes$' "$out"; then
+        pass "sshd_config writer preserves Port and forbidden keys"
+    else
+        fail "sshd_config writer preserves Port and forbidden keys"
+    fi
+    rm -rf "$tmp"
+}
+
+test_sshd_config_writer_only_changes_allowed_keys() {
+    tmp=$(make_test_dir)
+    in="$tmp/sshd_config"
+    out="$tmp/out"
+    {
+        printf '%s\n' "# PubkeyAuthentication no"
+        printf '%s\n' "PasswordAuthentication yes"
+        printf '%s\n' "# ChallengeResponseAuthentication yes"
+        printf '%s\n' "KbdInteractiveAuthentication yes"
+        printf '%s\n' "# PermitEmptyPasswords yes"
+        printf '%s\n' "PermitRootLogin yes"
+    } > "$in"
+    write_hardened_sshd_config "$in" "$out"
+    if grep -q '^PubkeyAuthentication yes$' "$out" &&
+        grep -q '^PasswordAuthentication no$' "$out" &&
+        grep -q '^ChallengeResponseAuthentication no$' "$out" &&
+        grep -q '^KbdInteractiveAuthentication no$' "$out" &&
+        grep -q '^PermitEmptyPasswords no$' "$out" &&
+        grep -q '^PermitRootLogin prohibit-password$' "$out"; then
+        pass "sshd_config writer updates only allowed keys"
+    else
+        fail "sshd_config writer updates only allowed keys"
+    fi
+    rm -rf "$tmp"
+}
+
 test_sshd_t_failure_restores_backup() {
     tmp=$(make_test_dir)
     old_path=$PATH
@@ -442,6 +612,104 @@ MOCK_SYSTEMCTL
     SSH_CONFIG=$old_ssh_config
     RUN_SSHD_DIR=$old_run_sshd_dir
     unset IKE_TEST_UID
+    rm -rf "$tmp"
+}
+
+test_restore_sshd_immutable_unlocks_and_relocks() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    old_ssh_config=$SSH_CONFIG
+    old_run_sshd_dir=$RUN_SSHD_DIR
+    old_flag=$SSHD_CONFIG_WAS_IMMUTABLE
+    mkdir -p "$tmp/bin"
+    SSH_CONFIG="$tmp/sshd_config"
+    RUN_SSHD_DIR="$tmp/run/sshd"
+    IKE_TEST_UID=0
+    export IKE_TEST_UID
+    printf '%s\n' "PasswordAuthentication yes" > "$SSH_CONFIG"
+    printf '%s\n' "PasswordAuthentication no" > "$SSH_CONFIG.bak.20260429_090000"
+    cat > "$tmp/bin/lsattr" <<'MOCK_LSATTR'
+#!/bin/sh
+printf '%s\n' '----i---------e------- '"$1"
+MOCK_LSATTR
+    cat > "$tmp/bin/chattr" <<'MOCK_CHATTR'
+#!/bin/sh
+printf '%s\n' "$*" >> "$CHATTR_LOG"
+exit 0
+MOCK_CHATTR
+    cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
+#!/bin/sh
+exit 0
+MOCK_SSHD
+    cat > "$tmp/bin/systemctl" <<'MOCK_SYSTEMCTL'
+#!/bin/sh
+exit 0
+MOCK_SYSTEMCTL
+    chmod +x "$tmp/bin/lsattr" "$tmp/bin/chattr" "$tmp/bin/sshd" "$tmp/bin/systemctl"
+    CHATTR_LOG="$tmp/chattr.log"
+    export CHATTR_LOG
+    PATH="$tmp/bin:$PATH"
+    backup=$(latest_sshd_backup)
+    if restore_sshd_config_from_backup "$backup" > "$tmp/out" 2>&1 &&
+        grep -q -- "-i $SSH_CONFIG" "$CHATTR_LOG" &&
+        grep -q -- "+i $SSH_CONFIG" "$CHATTR_LOG" &&
+        grep -q '^PasswordAuthentication no$' "$SSH_CONFIG"; then
+        pass "restore sshd_config unlocks and relocks immutable file"
+    else
+        fail "restore sshd_config unlocks and relocks immutable file"
+    fi
+    PATH=$old_path
+    SSH_CONFIG=$old_ssh_config
+    RUN_SSHD_DIR=$old_run_sshd_dir
+    SSHD_CONFIG_WAS_IMMUTABLE=$old_flag
+    unset IKE_TEST_UID CHATTR_LOG
+    rm -rf "$tmp"
+}
+
+test_restore_sshd_t_failure_restores_and_relocks() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    old_ssh_config=$SSH_CONFIG
+    old_run_sshd_dir=$RUN_SSHD_DIR
+    old_flag=$SSHD_CONFIG_WAS_IMMUTABLE
+    mkdir -p "$tmp/bin"
+    SSH_CONFIG="$tmp/sshd_config"
+    RUN_SSHD_DIR="$tmp/run/sshd"
+    IKE_TEST_UID=0
+    export IKE_TEST_UID
+    printf '%s\n' "PasswordAuthentication current" > "$SSH_CONFIG"
+    printf '%s\n' "PasswordAuthentication broken" > "$SSH_CONFIG.bak.20260429_090000"
+    cat > "$tmp/bin/lsattr" <<'MOCK_LSATTR'
+#!/bin/sh
+printf '%s\n' '----i---------e------- '"$1"
+MOCK_LSATTR
+    cat > "$tmp/bin/chattr" <<'MOCK_CHATTR'
+#!/bin/sh
+printf '%s\n' "$*" >> "$CHATTR_LOG"
+exit 0
+MOCK_CHATTR
+    cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
+#!/bin/sh
+exit 1
+MOCK_SSHD
+    chmod +x "$tmp/bin/lsattr" "$tmp/bin/chattr" "$tmp/bin/sshd"
+    CHATTR_LOG="$tmp/chattr.log"
+    export CHATTR_LOG
+    PATH="$tmp/bin:$PATH"
+    backup=$(latest_sshd_backup)
+    if restore_sshd_config_from_backup "$backup" > "$tmp/out" 2>&1; then
+        fail "restore sshd_config sshd -t failure restores and relocks"
+    elif grep -q '^PasswordAuthentication current$' "$SSH_CONFIG" &&
+        grep -q -- "+i $SSH_CONFIG" "$CHATTR_LOG"; then
+        pass "restore sshd_config sshd -t failure restores and relocks"
+    else
+        fail "restore sshd_config sshd -t failure restores and relocks"
+    fi
+    PATH=$old_path
+    SSH_CONFIG=$old_ssh_config
+    RUN_SSHD_DIR=$old_run_sshd_dir
+    SSHD_CONFIG_WAS_IMMUTABLE=$old_flag
+    unset IKE_TEST_UID CHATTR_LOG
     rm -rf "$tmp"
 }
 
@@ -896,10 +1164,18 @@ test_sshd_config_settings
 test_sshd_config_password_auth_no
 test_sshd_config_pubkey_yes
 test_sshd_config_permit_root
+test_immutable_detection_with_i
+test_immutable_detection_without_i
+test_unlock_immutable_calls_chattr
+test_relock_only_when_originally_immutable
+test_sshd_config_writer_does_not_modify_port_or_forbidden_keys
+test_sshd_config_writer_only_changes_allowed_keys
 test_sshd_t_failure_restores_backup
 test_restart_failure_restores_backup
 test_restore_latest_sshd_config_backup
 test_restore_sshd_shows_effective_config
+test_restore_sshd_immutable_unlocks_and_relocks
+test_restore_sshd_t_failure_restores_and_relocks
 test_restore_latest_authorized_keys_backup
 test_restore_list_reverse_order
 test_clear_authorized_keys_requires_yes

@@ -174,6 +174,8 @@ rc-service sshd restart
 
 Ubuntu 上如果缺少 `/run/sshd`，脚本会自动创建并设置权限为 `755`。
 
+部分 NAT VPS 商家会用 `chattr +i /etc/ssh/sshd_config` 锁定 SSH 配置，防止用户误改端口导致端口转发失效。脚本检测到这种情况时会临时执行 `chattr -i` 解锁，只修改密钥登录相关配置，不会修改 `Port`，完成校验和重启后会尝试恢复 immutable 锁定状态。
+
 ## 恢复备份
 
 如果登录异常，请通过云厂商 VNC/Console 登录服务器，重新运行脚本并选择菜单 `5`：

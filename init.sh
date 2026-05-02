@@ -16,6 +16,7 @@ CLI_MODE=""
 CLI_GITHUB_USER=""
 ASK_REPLY=""
 LOCAL_SSH_DIR=""
+SSHD_CONFIG_WAS_IMMUTABLE=0
 
 BLUE=$(printf '\033[34m')
 GREEN=$(printf '\033[32m')
@@ -42,6 +43,51 @@ error() {
 die() {
     error "$*"
     exit 1
+}
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+is_immutable_file() {
+    file="$1"
+    [ -e "$file" ] || return 1
+    command_exists lsattr || return 1
+    attrs=$(lsattr "$file" 2>/dev/null | awk '{print $1; exit}' || true)
+    case "$attrs" in
+        *i*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+unlock_immutable_if_needed() {
+    file="$1"
+    SSHD_CONFIG_WAS_IMMUTABLE=0
+    [ -e "$file" ] || return 0
+    if is_immutable_file "$file"; then
+        SSHD_CONFIG_WAS_IMMUTABLE=1
+        warn "检测到 sshd_config 被锁定，常见于 NAT VPS 或商家保护 SSH 端口转发场景。"
+        warn "脚本只会修改密钥登录相关配置，不会修改 Port。"
+        warn "完成后会恢复 immutable 锁定状态。"
+        if ! command_exists chattr || ! chattr -i "$file"; then
+            die "$file 被 immutable 锁定，且无法 chattr -i 解锁"
+        fi
+        warn "检测到 $file 被 immutable 锁定，已临时解锁"
+    fi
+}
+
+relock_immutable_if_needed() {
+    file="$1"
+    if [ "${SSHD_CONFIG_WAS_IMMUTABLE:-0}" = "1" ]; then
+        if command_exists chattr && chattr +i "$file"; then
+            success "已恢复 $file immutable 锁定状态"
+        else
+            warn "恢复 $file immutable 锁定状态失败，请手动执行: chattr +i $file"
+        fi
+    fi
+    SSHD_CONFIG_WAS_IMMUTABLE=0
 }
 
 print_blank() {
@@ -758,30 +804,82 @@ restart_ssh_service() {
 write_hardened_sshd_config() {
     input="$1"
     output="$2"
-    {
-        printf '%s\n' "PubkeyAuthentication yes"
-        printf '%s\n' "PasswordAuthentication no"
-        printf '%s\n' "ChallengeResponseAuthentication no"
-        printf '%s\n' "KbdInteractiveAuthentication no"
-        printf '%s\n' "PermitEmptyPasswords no"
-        printf '%s\n' "PermitRootLogin prohibit-password"
-        printf '\n'
-        awk '
-            /^[[:space:]]*#/ { print; next }
-            {
-                key = tolower($1)
-                if (key == "pubkeyauthentication" ||
-                    key == "passwordauthentication" ||
-                    key == "challengeresponseauthentication" ||
-                    key == "kbdinteractiveauthentication" ||
-                    key == "permitemptypasswords" ||
-                    key == "permitrootlogin") {
-                    next
-                }
-                print
+    awk '
+        function setting_for(key) {
+            key = tolower(key)
+            if (key == "pubkeyauthentication") return "PubkeyAuthentication yes"
+            if (key == "passwordauthentication") return "PasswordAuthentication no"
+            if (key == "challengeresponseauthentication") return "ChallengeResponseAuthentication no"
+            if (key == "kbdinteractiveauthentication") return "KbdInteractiveAuthentication no"
+            if (key == "permitemptypasswords") return "PermitEmptyPasswords no"
+            if (key == "permitrootlogin") return "PermitRootLogin prohibit-password"
+            return ""
+        }
+
+        function first_key(line, tmp, parts) {
+            tmp = line
+            sub(/^[[:space:]]*/, "", tmp)
+            if (substr(tmp, 1, 1) == "#") {
+                sub(/^#[[:space:]]*/, "", tmp)
             }
-        ' "$input"
-    } > "$output"
+            split(tmp, parts, /[[:space:]]+/)
+            return tolower(parts[1])
+        }
+
+        function is_active_match(line, tmp, parts) {
+            tmp = line
+            sub(/^[[:space:]]*/, "", tmp)
+            if (substr(tmp, 1, 1) == "#") return 0
+            split(tmp, parts, /[[:space:]]+/)
+            return tolower(parts[1]) == "match"
+        }
+
+        function mark_seen(key) {
+            key = tolower(key)
+            if (key == "pubkeyauthentication") seen_pubkey = 1
+            else if (key == "passwordauthentication") seen_password = 1
+            else if (key == "challengeresponseauthentication") seen_challenge = 1
+            else if (key == "kbdinteractiveauthentication") seen_kbd = 1
+            else if (key == "permitemptypasswords") seen_empty = 1
+            else if (key == "permitrootlogin") seen_root = 1
+        }
+
+        function emit_missing() {
+            if (inserted_missing) return
+            inserted_missing = 1
+            if (!seen_pubkey) print "PubkeyAuthentication yes"
+            if (!seen_password) print "PasswordAuthentication no"
+            if (!seen_challenge) print "ChallengeResponseAuthentication no"
+            if (!seen_kbd) print "KbdInteractiveAuthentication no"
+            if (!seen_empty) print "PermitEmptyPasswords no"
+            if (!seen_root) print "PermitRootLogin prohibit-password"
+        }
+
+        {
+            if (!in_match && is_active_match($0)) {
+                emit_missing()
+                in_match = 1
+                print
+                next
+            }
+
+            key = first_key($0)
+            replacement = ""
+            if (!in_match) {
+                replacement = setting_for(key)
+            }
+            if (replacement != "") {
+                print replacement
+                mark_seen(key)
+                next
+            }
+            print
+        }
+
+        END {
+            emit_missing()
+        }
+    ' "$input" > "$output"
 }
 
 restore_sshd_backup() {
@@ -799,11 +897,20 @@ harden_ssh_config() {
     info "正在修改 sshd_config..."
     cp -p "$SSH_CONFIG" "$backup" || die "备份 sshd_config 失败。"
     success "已备份 sshd_config: $backup"
-    write_hardened_sshd_config "$SSH_CONFIG" "$tmp_file" || die "生成 SSH 配置失败。"
-    mv "$tmp_file" "$SSH_CONFIG" || die "写入 SSH 配置失败。"
+    unlock_immutable_if_needed "$SSH_CONFIG"
+    if ! write_hardened_sshd_config "$SSH_CONFIG" "$tmp_file"; then
+        relock_immutable_if_needed "$SSH_CONFIG"
+        die "生成 SSH 配置失败。"
+    fi
+    if ! cp "$tmp_file" "$SSH_CONFIG"; then
+        relock_immutable_if_needed "$SSH_CONFIG"
+        die "写入 SSH 配置失败。"
+    fi
+    safe_rm_f "$tmp_file" || true
 
     if ! validate_sshd_config; then
         restore_sshd_backup "$backup" || true
+        relock_immutable_if_needed "$SSH_CONFIG"
         die "sshd -t 校验失败，已恢复备份。"
     fi
     success "SSH 配置校验通过"
@@ -812,8 +919,10 @@ harden_ssh_config() {
         warn "SSH 服务重启失败，正在恢复备份..."
         restore_sshd_backup "$backup" || true
         restart_ssh_service >/dev/null 2>&1 || true
+        relock_immutable_if_needed "$SSH_CONFIG"
         die "SSH 服务重启失败，已尝试恢复备份。请通过 VNC/Console 检查。"
     fi
+    relock_immutable_if_needed "$SSH_CONFIG"
     success "SSH 服务已重启"
     info "PermitRootLogin prohibit-password 表示禁止 root 密码登录，但允许 root 密钥登录。"
 }
@@ -919,23 +1028,31 @@ restore_sshd_config_from_backup() {
         return 1
     }
     require_root
+    unlock_immutable_if_needed "$SSH_CONFIG"
     before="$SSH_CONFIG.before-restore.$(timestamp)"
-    cp -p "$SSH_CONFIG" "$before" || return 1
+    if ! cp -p "$SSH_CONFIG" "$before"; then
+        relock_immutable_if_needed "$SSH_CONFIG"
+        return 1
+    fi
     if ! cp -p "$backup" "$SSH_CONFIG"; then
         cp -p "$before" "$SSH_CONFIG" || true
+        relock_immutable_if_needed "$SSH_CONFIG"
         return 1
     fi
     if ! validate_sshd_config; then
         cp -p "$before" "$SSH_CONFIG" || true
+        relock_immutable_if_needed "$SSH_CONFIG"
         error "恢复后的 sshd_config 未通过 sshd -t，已还原当前配置。"
         return 1
     fi
     if ! restart_ssh_service; then
         cp -p "$before" "$SSH_CONFIG" || true
         restart_ssh_service >/dev/null 2>&1 || true
+        relock_immutable_if_needed "$SSH_CONFIG"
         error "SSH 服务重启失败，已还原当前配置。"
         return 1
     fi
+    relock_immutable_if_needed "$SSH_CONFIG"
     success "sshd_config 已恢复。"
     success "SSH 服务已重启。"
     show_effective_ssh_config
