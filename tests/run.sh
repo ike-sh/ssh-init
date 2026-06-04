@@ -9,8 +9,8 @@ export IKE_TEST_MODE
 
 PASS_COUNT=0
 FAIL_COUNT=0
-VALID_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMockPublicKeyForTestsOnly1234567890 test@example"
-VALID_KEY_2="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCMockPublicKeyForTestsOnly1234567890 test@example"
+VALID_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBHiTtwHOMyc2QbrXv/15/f/TmESu5rAxMdF31qhnU8g test@example"
+VALID_KEY_2="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCYBsYdjo6CUSqYxQusah9Ae3dqIOQxJNS6OsiiQSyq/BPKWdIN1qw8AVPsDe6p9df/RhHtWZOI3gNwsRE39g7ijP/q0lGNMurx1LzxZGFbLjbXaATIZzlCARbJinQOBBjqpisUSf/2vhKRGQciDzC+YCgn/r+uDq4eXL/tSQuPZx72l5Yy+S1w+cKUwSAmBuLcCf3Ovyz8eIkM6NhP/+m9/GkT4TGdEjKdyPMY9mHZOipbJT5ri4ewQJoX9eEQElryb8rT0O2gjN6QXn2dPBC1AhQ4fUrSDc4Mo8mt82LIElX164Tr1xvdk3bzuFx28QKjmpooZmua2rvEJZSDbAcn test@example"
 
 pass() {
     PASS_COUNT=$((PASS_COUNT + 1))
@@ -74,12 +74,17 @@ test_ask_prompt_format() {
 }
 
 test_github_username_validation() {
+    name39="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    name40="${name39}a"
     if validate_github_username "ike-sh" &&
         validate_github_username "abc123" &&
+        validate_github_username "$name39" &&
         ! validate_github_username "" &&
         ! validate_github_username "-bad" &&
         ! validate_github_username "bad-" &&
-        ! validate_github_username "bad_name"; then
+        ! validate_github_username "bad_name" &&
+        ! validate_github_username "$name40" &&
+        ! validate_github_username "a--b"; then
         pass "GitHub username validation"
     else
         fail "GitHub username validation"
@@ -142,14 +147,55 @@ test_github_cli_does_not_print_full_tutorial() {
 }
 
 test_public_key_validation() {
+    malformed_rejected=0
+    if command -v ssh-keygen >/dev/null 2>&1; then
+        if ! normalize_key_line "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMalformedButBase64Like1234567890" >/dev/null 2>&1; then
+            malformed_rejected=1
+        fi
+    else
+        malformed_rejected=1
+    fi
     if normalize_key_line "$VALID_KEY" >/dev/null &&
         normalize_key_line "$VALID_KEY_2" >/dev/null &&
         ! normalize_key_line "ssh-dss AAAABadKey" >/dev/null 2>&1 &&
-        ! normalize_key_line "ssh-ed25519 not@base64" >/dev/null 2>&1; then
+        ! normalize_key_line "ssh-ed25519 not@base64" >/dev/null 2>&1 &&
+        [ "$malformed_rejected" = "1" ]; then
         pass "public key validation"
     else
         fail "public key validation"
     fi
+}
+
+test_public_key_ssh_keygen_deep_validation() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    mkdir -p "$tmp/bin"
+    cat > "$tmp/bin/ssh-keygen" <<'MOCK_KEYGEN'
+#!/bin/sh
+file=""
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "-f" ]; then
+        file="$2"
+        shift 2
+    else
+        shift
+    fi
+done
+if grep -q "MalformedButBase64Like" "$file"; then
+    exit 1
+fi
+exit 0
+MOCK_KEYGEN
+    chmod +x "$tmp/bin/ssh-keygen"
+    PATH="$tmp/bin:$PATH"
+    if normalize_key_line "$VALID_KEY" >/dev/null &&
+        ! normalize_key_line "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMalformedButBase64Like1234567890" >/dev/null 2>&1; then
+        pass "ssh-keygen validates public key format"
+    else
+        fail "ssh-keygen validates public key format"
+    fi
+    PATH=$old_path
+    rm -rf "$tmp"
 }
 
 test_github_keys_filtering() {
@@ -532,6 +578,252 @@ MOCK_RC
     SSH_CONFIG=$old_ssh_config
     RUN_SSHD_DIR=$old_run_sshd_dir
     unset IKE_TEST_UID
+    rm -rf "$tmp"
+}
+
+test_effective_include_password_yes_fails() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    old_ssh_config=$SSH_CONFIG
+    old_run_sshd_dir=$RUN_SSHD_DIR
+    mkdir -p "$tmp/bin" "$tmp/conf.d"
+    SSH_CONFIG="$tmp/sshd_config"
+    RUN_SSHD_DIR="$tmp/run/sshd"
+    IKE_TEST_UID=0
+    export IKE_TEST_UID
+    include="$tmp/conf.d/early.conf"
+    {
+        printf '%s\n' "Include $include"
+        printf '%s\n' "PasswordAuthentication no"
+    } > "$SSH_CONFIG"
+    printf '%s\n' "PasswordAuthentication yes" > "$include"
+    cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
+#!/bin/sh
+mode=""
+config=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -T)
+            mode="T"
+            shift
+            ;;
+        -t)
+            mode="t"
+            shift
+            ;;
+        -f)
+            config="$2"
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+if [ "$mode" = "T" ]; then
+    include=$(awk 'tolower($1) == "include" { print $2; exit }' "$config")
+    if [ -n "$include" ] && grep -q '^PasswordAuthentication yes$' "$include"; then
+        printf '%s\n' "pubkeyauthentication yes"
+        printf '%s\n' "passwordauthentication yes"
+        printf '%s\n' "kbdinteractiveauthentication no"
+        printf '%s\n' "permitemptypasswords no"
+        printf '%s\n' "permitrootlogin prohibit-password"
+        exit 0
+    fi
+fi
+exit 0
+MOCK_SSHD
+    cat > "$tmp/bin/systemctl" <<'MOCK_SYSTEMCTL'
+#!/bin/sh
+printf '%s\n' "restart" >> "$RESTART_LOG"
+exit 0
+MOCK_SYSTEMCTL
+    chmod +x "$tmp/bin/sshd" "$tmp/bin/systemctl"
+    RESTART_LOG="$tmp/restart.log"
+    export RESTART_LOG
+    PATH="$tmp/bin:$PATH"
+    if (harden_ssh_config > "$tmp/out" 2>&1); then
+        fail "effective Include password yes fails"
+    elif grep -q "最终生效配置不符合预期" "$tmp/out" &&
+        grep -q "^Include $include$" "$SSH_CONFIG" &&
+        [ ! -s "$RESTART_LOG" ]; then
+        pass "effective Include password yes fails"
+    else
+        fail "effective Include password yes fails"
+    fi
+    PATH=$old_path
+    SSH_CONFIG=$old_ssh_config
+    RUN_SSHD_DIR=$old_run_sshd_dir
+    unset IKE_TEST_UID RESTART_LOG
+    rm -rf "$tmp"
+}
+
+test_authentication_methods_blocks_hardening() {
+    tmp=$(make_test_dir)
+    old_ssh_config=$SSH_CONFIG
+    mkdir -p "$tmp/conf.d"
+    SSH_CONFIG="$tmp/sshd_config"
+    include="$tmp/conf.d/auth.conf"
+    IKE_TEST_UID=0
+    export IKE_TEST_UID
+    printf '%s\n' "Include $include" > "$SSH_CONFIG"
+    printf '%s\n' "AuthenticationMethods publickey,password" > "$include"
+    if (harden_ssh_config > "$tmp/out" 2>&1); then
+        fail "AuthenticationMethods publickey,password blocks hardening"
+    elif grep -q "AuthenticationMethods publickey,password" "$tmp/out" &&
+        grep -q "继续可能导致 SSH 无法登录" "$tmp/out" &&
+        grep -q "改为 AuthenticationMethods publickey" "$tmp/out" &&
+        [ "$(find "$tmp" -name 'sshd_config.bak.*' | wc -l | awk '{print $1}')" = "0" ]; then
+        pass "AuthenticationMethods publickey,password blocks hardening"
+    else
+        fail "AuthenticationMethods publickey,password blocks hardening"
+    fi
+    SSH_CONFIG=$old_ssh_config
+    unset IKE_TEST_UID
+    rm -rf "$tmp"
+}
+
+test_match_password_yes_warns_and_preserves() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    old_ssh_config=$SSH_CONFIG
+    old_run_sshd_dir=$RUN_SSHD_DIR
+    mkdir -p "$tmp/bin"
+    SSH_CONFIG="$tmp/sshd_config"
+    RUN_SSHD_DIR="$tmp/run/sshd"
+    IKE_TEST_UID=0
+    export IKE_TEST_UID
+    {
+        printf '%s\n' "PasswordAuthentication yes"
+        printf '%s\n' "Match User deploy"
+        printf '%s\n' "    PasswordAuthentication yes"
+    } > "$SSH_CONFIG"
+    cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
+#!/bin/sh
+if [ "$1" = "-T" ]; then
+    printf '%s\n' "pubkeyauthentication yes"
+    printf '%s\n' "passwordauthentication no"
+    printf '%s\n' "kbdinteractiveauthentication no"
+    printf '%s\n' "permitemptypasswords no"
+    printf '%s\n' "permitrootlogin prohibit-password"
+fi
+exit 0
+MOCK_SSHD
+    cat > "$tmp/bin/systemctl" <<'MOCK_SYSTEMCTL'
+#!/bin/sh
+exit 0
+MOCK_SYSTEMCTL
+    chmod +x "$tmp/bin/sshd" "$tmp/bin/systemctl"
+    PATH="$tmp/bin:$PATH"
+    if harden_ssh_config > "$tmp/out" 2>&1 &&
+        grep -q '^PasswordAuthentication no$' "$SSH_CONFIG" &&
+        grep -q '^    PasswordAuthentication yes$' "$SSH_CONFIG" &&
+        [ "$(grep -c "检测到 Match 块可能覆盖全局 SSH 安全策略" "$tmp/out")" -ge 2 ]; then
+        pass "Match PasswordAuthentication yes warns and preserves block"
+    else
+        fail "Match PasswordAuthentication yes warns and preserves block"
+    fi
+    PATH=$old_path
+    SSH_CONFIG=$old_ssh_config
+    RUN_SSHD_DIR=$old_run_sshd_dir
+    unset IKE_TEST_UID
+    rm -rf "$tmp"
+}
+
+test_atomic_write_failure_restores_backup() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    old_ssh_config=$SSH_CONFIG
+    old_run_sshd_dir=$RUN_SSHD_DIR
+    mkdir -p "$tmp/bin"
+    SSH_CONFIG="$tmp/sshd_config"
+    RUN_SSHD_DIR="$tmp/run/sshd"
+    IKE_TEST_UID=0
+    export IKE_TEST_UID
+    printf '%s\n' "PasswordAuthentication yes" > "$SSH_CONFIG"
+    cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
+#!/bin/sh
+if [ "$1" = "-T" ]; then
+    printf '%s\n' "pubkeyauthentication yes"
+    printf '%s\n' "passwordauthentication no"
+    printf '%s\n' "kbdinteractiveauthentication no"
+    printf '%s\n' "permitemptypasswords no"
+    printf '%s\n' "permitrootlogin prohibit-password"
+fi
+exit 0
+MOCK_SSHD
+    cat > "$tmp/bin/mv" <<'MOCK_MV'
+#!/bin/sh
+exit 1
+MOCK_MV
+    cat > "$tmp/bin/systemctl" <<'MOCK_SYSTEMCTL'
+#!/bin/sh
+printf '%s\n' "restart" >> "$RESTART_LOG"
+exit 0
+MOCK_SYSTEMCTL
+    chmod +x "$tmp/bin/sshd" "$tmp/bin/mv" "$tmp/bin/systemctl"
+    RESTART_LOG="$tmp/restart.log"
+    export RESTART_LOG
+    PATH="$tmp/bin:$PATH"
+    if (harden_ssh_config > "$tmp/out" 2>&1); then
+        fail "atomic write failure restores backup"
+    elif grep -q '^PasswordAuthentication yes$' "$SSH_CONFIG" &&
+        grep -q "写入 SSH 配置失败，已恢复备份" "$tmp/out" &&
+        [ ! -s "$RESTART_LOG" ]; then
+        pass "atomic write failure restores backup"
+    else
+        fail "atomic write failure restores backup"
+    fi
+    PATH=$old_path
+    SSH_CONFIG=$old_ssh_config
+    RUN_SSHD_DIR=$old_run_sshd_dir
+    unset IKE_TEST_UID RESTART_LOG
+    rm -rf "$tmp"
+}
+
+test_effective_sshd_T_failure_restores_backup() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    old_ssh_config=$SSH_CONFIG
+    old_run_sshd_dir=$RUN_SSHD_DIR
+    mkdir -p "$tmp/bin"
+    SSH_CONFIG="$tmp/sshd_config"
+    RUN_SSHD_DIR="$tmp/run/sshd"
+    IKE_TEST_UID=0
+    export IKE_TEST_UID
+    printf '%s\n' "PasswordAuthentication yes" > "$SSH_CONFIG"
+    cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
+#!/bin/sh
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "-T" ]; then
+        exit 1
+    fi
+    shift
+done
+exit 0
+MOCK_SSHD
+    cat > "$tmp/bin/systemctl" <<'MOCK_SYSTEMCTL'
+#!/bin/sh
+printf '%s\n' "restart" >> "$RESTART_LOG"
+exit 0
+MOCK_SYSTEMCTL
+    chmod +x "$tmp/bin/sshd" "$tmp/bin/systemctl"
+    RESTART_LOG="$tmp/restart.log"
+    export RESTART_LOG
+    PATH="$tmp/bin:$PATH"
+    if (harden_ssh_config > "$tmp/out" 2>&1); then
+        fail "sshd -T failure restores backup"
+    elif grep -q '^PasswordAuthentication yes$' "$SSH_CONFIG" &&
+        grep -q "最终生效配置不符合预期" "$tmp/out" &&
+        [ ! -s "$RESTART_LOG" ]; then
+        pass "sshd -T failure restores backup"
+    else
+        fail "sshd -T failure restores backup"
+    fi
+    PATH=$old_path
+    SSH_CONFIG=$old_ssh_config
+    RUN_SSHD_DIR=$old_run_sshd_dir
+    unset IKE_TEST_UID RESTART_LOG
     rm -rf "$tmp"
 }
 
@@ -1156,6 +1448,7 @@ test_github_empty_hint
 test_github_import_tutorial_output
 test_github_cli_does_not_print_full_tutorial
 test_public_key_validation
+test_public_key_ssh_keygen_deep_validation
 test_github_keys_filtering
 test_authorized_keys_append_dedup_and_permissions
 test_symlink_ssh_rejected
@@ -1172,6 +1465,11 @@ test_sshd_config_writer_does_not_modify_port_or_forbidden_keys
 test_sshd_config_writer_only_changes_allowed_keys
 test_sshd_t_failure_restores_backup
 test_restart_failure_restores_backup
+test_effective_include_password_yes_fails
+test_authentication_methods_blocks_hardening
+test_match_password_yes_warns_and_preserves
+test_atomic_write_failure_restores_backup
+test_effective_sshd_T_failure_restores_backup
 test_restore_latest_sshd_config_backup
 test_restore_sshd_shows_effective_config
 test_restore_sshd_immutable_unlocks_and_relocks

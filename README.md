@@ -161,7 +161,13 @@ PermitRootLogin prohibit-password
 ~/.ssh/authorized_keys.bak.YYYYmmdd_HHMMSS
 ```
 
-修改后会执行 `sshd -t` 或 `/usr/sbin/sshd -t` 校验，并按顺序尝试重启 SSH：
+修改后会先执行 `sshd -t -f /etc/ssh/sshd_config` 做语法校验，再执行 `sshd -T -f /etc/ssh/sshd_config` 检查最终生效配置，确认密码登录确实关闭、公钥登录仍启用。`sshd -T` 可以发现 `Include`、`Match` 等配置导致的最终生效值偏差；如果最终生效配置不符合预期，脚本会恢复备份并停止，不会重启 SSH。
+
+如果全局配置或 `Include` 引入的配置中存在 `AuthenticationMethods publickey,password` 或包含 `keyboard-interactive` 的多因素认证要求，脚本会中止加固。因为脚本会禁用 `password`/`keyboard-interactive`，继续执行可能导致 SSH 无法登录。请先手动改为 `AuthenticationMethods publickey`，或删除该项后重试。
+
+脚本不会自动修改 `Match` 块；如果 `Match` 块里覆盖了 `PasswordAuthentication yes`、`KbdInteractiveAuthentication yes`、`ChallengeResponseAuthentication yes`、`PubkeyAuthentication no` 或 `PermitRootLogin yes`，脚本会输出醒目警告，请确认特定用户或地址仍允许密码登录是否符合预期。
+
+最终校验通过后，脚本会按顺序尝试重启 SSH：
 
 ```text
 systemctl restart ssh
@@ -214,7 +220,7 @@ sh init.sh status
 
 ## 安全提醒
 
-运行前建议确认云厂商 VNC/Console 可用。脚本执行成功后，请不要立即关闭当前 SSH 窗口，先新开一个终端测试密钥登录是否成功，确认可以用私钥登录后再关闭当前窗口。
+运行前建议确认云厂商 VNC/Console 可用。脚本执行成功后，请不要立即关闭当前 SSH 窗口，建议另开一个新的 SSH 窗口测试密钥登录是否成功，确认可以用私钥登录后再关闭当前窗口。
 
 不建议使用 `curl | sh` 直接管道执行；推荐像上面的命令一样先下载固定版本脚本，再执行。
 

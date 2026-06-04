@@ -17,6 +17,8 @@ CLI_GITHUB_USER=""
 ASK_REPLY=""
 LOCAL_SSH_DIR=""
 SSHD_CONFIG_WAS_IMMUTABLE=0
+SSHD_CONFIG_TMP_FILE=""
+SSH_KEYGEN_WARNED=0
 
 BLUE=$(printf '\033[34m')
 GREEN=$(printf '\033[32m')
@@ -124,6 +126,13 @@ cleanup_tmp() {
         case "$TMP_DIR" in
             */ssh-init.*)
                 rm -rf "$TMP_DIR"
+                ;;
+        esac
+    fi
+    if [ -n "${SSHD_CONFIG_TMP_FILE:-}" ]; then
+        case "$SSHD_CONFIG_TMP_FILE" in
+            */.sshd_config.ssh-init.*|*/.*.ssh-init.*)
+                rm -f "$SSHD_CONFIG_TMP_FILE"
                 ;;
         esac
     fi
@@ -260,6 +269,13 @@ validate_github_username() {
             return 1
             ;;
     esac
+    name_len=$(printf '%s' "$name" | wc -c | awk '{print $1}')
+    [ "$name_len" -le 39 ] || return 1
+    case "$name" in
+        *--*)
+            return 1
+            ;;
+    esac
     return 0
 }
 
@@ -277,6 +293,7 @@ normalize_key_line() {
     line=$(printf '%s\n' "$1" | awk '{$1=$1; print}')
     key_type=$(printf '%s\n' "$line" | awk '{print $1}')
     key_data=$(printf '%s\n' "$line" | awk '{print $2}')
+    key_extra=$(printf '%s\n' "$line" | awk '{print $3}')
 
     case "$key_type" in
         ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com)
@@ -294,7 +311,30 @@ normalize_key_line() {
 
     key_len=$(printf '%s' "$key_data" | wc -c | awk '{print $1}')
     [ "$key_len" -ge 20 ] || return 1
-    printf '%s\n' "$line"
+
+    if command_exists ssh-keygen; then
+        tmp_key_file=$(make_tmp_file "public-key")
+        if ! printf '%s %s\n' "$key_type" "$key_data" > "$tmp_key_file"; then
+            safe_rm_f "$tmp_key_file" || true
+            return 1
+        fi
+        if ! ssh-keygen -l -f "$tmp_key_file" >/dev/null 2>&1; then
+            safe_rm_f "$tmp_key_file" || true
+            return 1
+        fi
+        safe_rm_f "$tmp_key_file" || true
+    else
+        if [ "${SSH_KEYGEN_WARNED:-0}" != "1" ]; then
+            warn "未找到 ssh-keygen，公钥格式仅使用基础规则校验。"
+            SSH_KEYGEN_WARNED=1
+        fi
+    fi
+
+    if [ -n "$key_extra" ]; then
+        printf '%s\n' "$line"
+    else
+        printf '%s %s\n' "$key_type" "$key_data"
+    fi
 }
 
 filter_valid_keys() {
@@ -777,11 +817,278 @@ find_sshd_bin() {
     return 1
 }
 
-validate_sshd_config() {
+validate_sshd_config_file() {
+    config_file="$1"
     ensure_run_sshd_dir || return 1
     sshd_bin=$(find_sshd_bin 2>/dev/null || true)
     [ -n "$sshd_bin" ] || return 1
-    "$sshd_bin" -t
+    "$sshd_bin" -t -f "$config_file"
+}
+
+validate_sshd_config() {
+    validate_sshd_config_file "$SSH_CONFIG"
+}
+
+effective_sshd_settings_check() {
+    config_file="$1"
+    ensure_run_sshd_dir || return 1
+    sshd_bin=$(find_sshd_bin 2>/dev/null || true)
+    [ -n "$sshd_bin" ] || return 1
+    effective_file=$(make_tmp_file "sshd-effective")
+    "$sshd_bin" -T -f "$config_file" > "$effective_file" 2>/dev/null || return 1
+    awk '
+        {
+            key = tolower($1)
+            value = tolower($2)
+            seen[key] = 1
+            values[key] = value
+        }
+        END {
+            ok = 1
+            if (seen["pubkeyauthentication"] && values["pubkeyauthentication"] != "yes") ok = 0
+            if (seen["passwordauthentication"] && values["passwordauthentication"] != "no") ok = 0
+            if (seen["kbdinteractiveauthentication"] && values["kbdinteractiveauthentication"] != "no") ok = 0
+            if (seen["permitemptypasswords"] && values["permitemptypasswords"] != "no") ok = 0
+            if (seen["challengeresponseauthentication"] && values["challengeresponseauthentication"] != "no") ok = 0
+            if (seen["permitrootlogin"] &&
+                values["permitrootlogin"] != "prohibit-password" &&
+                values["permitrootlogin"] != "without-password") ok = 0
+            exit ok ? 0 : 1
+        }
+    ' "$effective_file"
+}
+
+ssh_init_dirname() {
+    path="$1"
+    dir=${path%/*}
+    if [ "$dir" = "$path" ]; then
+        printf '%s\n' "."
+    elif [ -n "$dir" ]; then
+        printf '%s\n' "$dir"
+    else
+        printf '%s\n' "/"
+    fi
+}
+
+has_path_glob() {
+    case "$1" in
+        *\**|*\?*|*\[*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+list_path_matches() {
+    pattern="$1"
+    dir=$(ssh_init_dirname "$pattern")
+    base=${pattern##*/}
+    if has_path_glob "$base"; then
+        [ -d "$dir" ] || return 0
+        find "$dir" -maxdepth 1 -type f -name "$base" 2>/dev/null | sort
+    elif [ -f "$pattern" ]; then
+        printf '%s\n' "$pattern"
+    fi
+}
+
+list_include_matches() {
+    pattern="$1"
+    current_dir="$2"
+    if [ -z "$pattern" ]; then
+        return 0
+    fi
+    case "$pattern" in
+        /*)
+            list_path_matches "$pattern"
+            ;;
+        *)
+            list_path_matches "/etc/ssh/$pattern"
+            if [ "$current_dir" != "/etc/ssh" ]; then
+                list_path_matches "$current_dir/$pattern"
+            fi
+            ;;
+    esac
+}
+
+config_file_include_patterns() {
+    file="$1"
+    [ -f "$file" ] || return 0
+    awk '
+        {
+            line = $0
+            sub(/\r$/, "", line)
+            sub(/^[[:space:]]*/, "", line)
+            if (line == "" || substr(line, 1, 1) == "#") next
+            sub(/[[:space:]]+#.*/, "", line)
+            n = split(line, parts, /[[:space:]]+/)
+            key = tolower(parts[1])
+            if (key == "match") {
+                in_match = 1
+                next
+            }
+            if (!in_match && key == "include") {
+                for (i = 2; i <= n; i++) {
+                    if (parts[i] != "") print parts[i]
+                }
+            }
+        }
+    ' "$file"
+}
+
+config_file_authentication_methods_risk() {
+    file="$1"
+    [ -f "$file" ] || return 0
+    awk -v file="$file" '
+        {
+            line = $0
+            sub(/\r$/, "", line)
+            sub(/^[[:space:]]*/, "", line)
+            if (line == "" || substr(line, 1, 1) == "#") next
+            sub(/[[:space:]]+#.*/, "", line)
+            n = split(line, parts, /[[:space:]]+/)
+            key = tolower(parts[1])
+            if (key == "match") {
+                in_match = 1
+                next
+            }
+            if (!in_match && key == "authenticationmethods") {
+                value = ""
+                for (i = 2; i <= n; i++) {
+                    value = value (value == "" ? "" : " ") parts[i]
+                }
+                lower = tolower(value)
+                if (lower ~ /(^|[,[:space:]])password([,[:space:]]|$)/ ||
+                    lower ~ /(^|[,[:space:]])keyboard-interactive([,:[:space:]]|$)/) {
+                    print file ":" NR ": AuthenticationMethods " value
+                    exit
+                }
+            }
+        }
+    ' "$file"
+}
+
+config_file_match_override_risk() {
+    file="$1"
+    [ -f "$file" ] || return 0
+    awk -v file="$file" '
+        {
+            line = $0
+            sub(/\r$/, "", line)
+            sub(/^[[:space:]]*/, "", line)
+            if (line == "" || substr(line, 1, 1) == "#") next
+            sub(/[[:space:]]+#.*/, "", line)
+            n = split(line, parts, /[[:space:]]+/)
+            key = tolower(parts[1])
+            value = tolower(parts[2])
+            if (key == "match") {
+                in_match = 1
+                next
+            }
+            if (in_match &&
+                ((key == "passwordauthentication" && value == "yes") ||
+                 (key == "kbdinteractiveauthentication" && value == "yes") ||
+                 (key == "challengeresponseauthentication" && value == "yes") ||
+                 (key == "pubkeyauthentication" && value == "no") ||
+                 (key == "permitrootlogin" && value == "yes"))) {
+                print file ":" NR ": " line
+                exit
+            }
+        }
+    ' "$file"
+}
+
+scan_authentication_methods_risk_file() {
+    file="$1"
+    depth="$2"
+    [ -f "$file" ] || return 0
+
+    risk=$(config_file_authentication_methods_risk "$file" || true)
+    if [ -n "$risk" ]; then
+        AUTHENTICATION_METHODS_RISK="$risk"
+        return 1
+    fi
+    [ "$depth" -ge 3 ] && return 0
+
+    include_file=$(make_tmp_file "sshd-includes")
+    config_file_include_patterns "$file" > "$include_file" || return 0
+    current_dir=$(ssh_init_dirname "$file")
+    while IFS= read -r pattern || [ -n "$pattern" ]; do
+        matches_file=$(make_tmp_file "sshd-include-matches")
+        list_include_matches "$pattern" "$current_dir" > "$matches_file" || true
+        while IFS= read -r included || [ -n "$included" ]; do
+            [ -f "$included" ] || continue
+            scan_authentication_methods_risk_file "$included" "$((depth + 1))" || return 1
+        done < "$matches_file"
+    done < "$include_file"
+    return 0
+}
+
+detect_authentication_methods_risk() {
+    AUTHENTICATION_METHODS_RISK=""
+    scan_authentication_methods_risk_file "$1" 0
+}
+
+scan_match_override_risk_file() {
+    file="$1"
+    depth="$2"
+    [ -f "$file" ] || return 0
+    [ "$MATCH_OVERRIDE_RISK_FOUND" = "1" ] && return 0
+
+    risk=$(config_file_match_override_risk "$file" || true)
+    if [ -n "$risk" ]; then
+        MATCH_OVERRIDE_RISK="$risk"
+        MATCH_OVERRIDE_RISK_FOUND=1
+        return 0
+    fi
+    [ "$depth" -ge 3 ] && return 0
+
+    include_file=$(make_tmp_file "sshd-includes")
+    config_file_include_patterns "$file" > "$include_file" || return 0
+    current_dir=$(ssh_init_dirname "$file")
+    while IFS= read -r pattern || [ -n "$pattern" ]; do
+        matches_file=$(make_tmp_file "sshd-include-matches")
+        list_include_matches "$pattern" "$current_dir" > "$matches_file" || true
+        while IFS= read -r included || [ -n "$included" ]; do
+            [ -f "$included" ] || continue
+            scan_match_override_risk_file "$included" "$((depth + 1))"
+            [ "$MATCH_OVERRIDE_RISK_FOUND" = "1" ] && return 0
+        done < "$matches_file"
+    done < "$include_file"
+}
+
+detect_match_override_risk() {
+    MATCH_OVERRIDE_RISK=""
+    MATCH_OVERRIDE_RISK_FOUND=0
+    scan_match_override_risk_file "$1" 0
+    [ "$MATCH_OVERRIDE_RISK_FOUND" = "1" ]
+}
+
+make_sshd_config_tmp_file() {
+    target="$1"
+    dir=$(ssh_init_dirname "$target")
+    base=${target##*/}
+    [ -d "$dir" ] || return 1
+    old_umask=$(umask)
+    umask 077
+    tmp_file=""
+    if command_exists mktemp; then
+        tmp_file=$(mktemp "$dir/.$base.ssh-init.XXXXXX" 2>/dev/null || true)
+    fi
+    if [ -z "$tmp_file" ]; then
+        i=0
+        while [ "$i" -lt 10 ]; do
+            candidate="$dir/.$base.ssh-init.$$.$i"
+            if (set -C; : > "$candidate") 2>/dev/null; then
+                tmp_file="$candidate"
+                break
+            fi
+            i=$((i + 1))
+        done
+    fi
+    umask "$old_umask"
+    [ -n "$tmp_file" ] || return 1
+    SSHD_CONFIG_TMP_FILE="$tmp_file"
+    printf '%s\n' "$tmp_file"
 }
 
 restart_ssh_service() {
@@ -889,24 +1196,68 @@ restore_sshd_backup() {
     cp -p "$backup" "$SSH_CONFIG"
 }
 
+warn_match_override_risk() {
+    warn "检测到 Match 块可能覆盖全局 SSH 安全策略，请确认特定用户/地址仍允许密码登录是否符合预期。"
+    if [ -n "${MATCH_OVERRIDE_RISK:-}" ]; then
+        warn "风险位置: $MATCH_OVERRIDE_RISK"
+    fi
+}
+
 harden_ssh_config() {
     require_root
     [ -f "$SSH_CONFIG" ] || die "找不到 SSH 配置文件: $SSH_CONFIG"
+    if ! detect_authentication_methods_risk "$SSH_CONFIG"; then
+        auth_methods=$(printf '%s\n' "$AUTHENTICATION_METHODS_RISK" | sed 's/^.*: AuthenticationMethods //')
+        error "当前配置要求多因素认证 AuthenticationMethods $auth_methods，但脚本会禁用 password，继续可能导致 SSH 无法登录。"
+        error "请手动修复：改为 AuthenticationMethods publickey，或先删除该项后重试。"
+        exit 1
+    fi
+    match_override_warned=0
+    if detect_match_override_risk "$SSH_CONFIG"; then
+        match_override_warned=1
+        warn_match_override_risk
+    fi
     backup="$SSH_CONFIG.bak.$(timestamp)"
-    tmp_file=$(make_tmp_file "sshd_config")
+    tmp_file=""
     info "正在修改 sshd_config..."
     cp -p "$SSH_CONFIG" "$backup" || die "备份 sshd_config 失败。"
     success "已备份 sshd_config: $backup"
     unlock_immutable_if_needed "$SSH_CONFIG"
+    tmp_file=$(make_sshd_config_tmp_file "$SSH_CONFIG" 2>/dev/null || true)
+    if [ -z "$tmp_file" ]; then
+        restore_sshd_backup "$backup" || true
+        relock_immutable_if_needed "$SSH_CONFIG"
+        die "创建 SSH 配置临时文件失败，已恢复备份。"
+    fi
+    if ! cp -p "$SSH_CONFIG" "$tmp_file"; then
+        safe_rm_f "$tmp_file" || true
+        SSHD_CONFIG_TMP_FILE=""
+        restore_sshd_backup "$backup" || true
+        relock_immutable_if_needed "$SSH_CONFIG"
+        die "准备 SSH 配置临时文件失败，已恢复备份。"
+    fi
     if ! write_hardened_sshd_config "$SSH_CONFIG" "$tmp_file"; then
+        safe_rm_f "$tmp_file" || true
+        SSHD_CONFIG_TMP_FILE=""
+        restore_sshd_backup "$backup" || true
         relock_immutable_if_needed "$SSH_CONFIG"
-        die "生成 SSH 配置失败。"
+        die "生成 SSH 配置失败，已恢复备份。"
     fi
-    if ! cp "$tmp_file" "$SSH_CONFIG"; then
+    if ! validate_sshd_config_file "$tmp_file"; then
+        safe_rm_f "$tmp_file" || true
+        SSHD_CONFIG_TMP_FILE=""
+        restore_sshd_backup "$backup" || true
         relock_immutable_if_needed "$SSH_CONFIG"
-        die "写入 SSH 配置失败。"
+        die "sshd -t 校验失败，已恢复备份。"
     fi
-    safe_rm_f "$tmp_file" || true
+    if ! mv -f "$tmp_file" "$SSH_CONFIG"; then
+        safe_rm_f "$tmp_file" || true
+        SSHD_CONFIG_TMP_FILE=""
+        restore_sshd_backup "$backup" || true
+        relock_immutable_if_needed "$SSH_CONFIG"
+        die "写入 SSH 配置失败，已恢复备份。"
+    fi
+    SSHD_CONFIG_TMP_FILE=""
 
     if ! validate_sshd_config; then
         restore_sshd_backup "$backup" || true
@@ -914,6 +1265,12 @@ harden_ssh_config() {
         die "sshd -t 校验失败，已恢复备份。"
     fi
     success "SSH 配置校验通过"
+    if ! effective_sshd_settings_check "$SSH_CONFIG"; then
+        restore_sshd_backup "$backup" || true
+        relock_immutable_if_needed "$SSH_CONFIG"
+        die "配置语法通过，但最终生效配置不符合预期，可能被 Include 或 Match 覆盖。"
+    fi
+    success "SSH 最终生效配置校验通过"
 
     if ! restart_ssh_service; then
         warn "SSH 服务重启失败，正在恢复备份..."
@@ -924,6 +1281,9 @@ harden_ssh_config() {
     fi
     relock_immutable_if_needed "$SSH_CONFIG"
     success "SSH 服务已重启"
+    if [ "$match_override_warned" = "1" ]; then
+        warn_match_override_risk
+    fi
     info "PermitRootLogin prohibit-password 表示禁止 root 密码登录，但允许 root 密钥登录。"
 }
 
