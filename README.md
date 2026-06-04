@@ -17,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/ike-sh/ssh-init/main/init.sh -o ini
 如果你想固定行为、不受 `main` 更新影响，可以使用 tag 版本。生产环境更建议固定 tag；普通用户可以直接用 `main`。
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ike-sh/ssh-init/v0.5.1/init.sh -o init.sh && sh init.sh
+curl -fsSL https://raw.githubusercontent.com/ike-sh/ssh-init/v0.5.2/init.sh -o init.sh && sh init.sh
 ```
 
 运行后会看到：
@@ -154,6 +154,20 @@ PermitRootLogin prohibit-password
 
 `PermitRootLogin prohibit-password` 表示禁止 root 密码登录，但允许 root 密钥登录。
 
+如果主配置中包含可用的 drop-in 目录，例如：
+
+```text
+Include /etc/ssh/sshd_config.d/*.conf
+```
+
+脚本会优先新增或更新：
+
+```text
+/etc/ssh/sshd_config.d/00-ssh-init-hardening.conf
+```
+
+这样安全配置会在 `01-*`、`50-*` 等云厂商或发行版 drop-in 之前加载，避免被 OpenSSH 的 first obtained value 规则绕过。脚本不会删除用户已有的 drop-in 文件。
+
 脚本会在修改前备份：
 
 ```text
@@ -181,6 +195,51 @@ rc-service sshd restart
 Ubuntu 上如果缺少 `/run/sshd`，脚本会自动创建并设置权限为 `755`。
 
 部分 NAT VPS 商家会用 `chattr +i /etc/ssh/sshd_config` 锁定 SSH 配置，防止用户误改端口导致端口转发失效。脚本检测到这种情况时会临时执行 `chattr -i` 解锁，只修改密钥登录相关配置，不会修改 `Port`，完成校验和重启后会尝试恢复 immutable 锁定状态。
+
+## 为什么提示“配置语法通过，但最终生效配置不符合预期”？
+
+很多云服务器会在 `/etc/ssh/sshd_config` 中包含：
+
+```text
+Include /etc/ssh/sshd_config.d/*.conf
+```
+
+这些 drop-in 文件可能包括：
+
+```text
+01-permitrootlogin.conf
+50-cloud-init.conf
+```
+
+它们可能提前设置：
+
+```text
+PermitRootLogin yes
+PasswordAuthentication yes
+```
+
+OpenSSH 对同一关键字通常采用 first obtained value，所以只在主配置后面追加 `PasswordAuthentication no` 可能不生效。新版脚本会在可用时写入 `/etc/ssh/sshd_config.d/00-ssh-init-hardening.conf`，让安全配置优先加载，并继续通过 `sshd -T` 验证最终生效配置。
+
+如果存在危险配置，例如 `AuthenticationMethods publickey,password` 或 `AuthenticationMethods publickey,keyboard-interactive`，脚本仍会中止，避免禁用密码/键盘交互后把 SSH 登录链路锁死。
+
+执行成功后仍建议不要关闭当前 SSH 窗口，另开新窗口测试密钥登录。
+
+诊断最终生效配置可以运行：
+
+```sh
+sh init.sh --debug-effective
+```
+
+也可以手动排查：
+
+```sh
+sshd_bin="$(command -v sshd || printf /usr/sbin/sshd)"
+
+"$sshd_bin" -T -f /etc/ssh/sshd_config | grep -Ei '^(pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|permitemptypasswords|permitrootlogin|authenticationmethods) '
+
+grep -RInE '^[[:space:]]*(Include|PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|PermitEmptyPasswords|PermitRootLogin|PubkeyAuthentication|AuthenticationMethods|Match)\b' \
+  /etc/ssh/sshd_config /etc/ssh/sshd_config.d 2>/dev/null
+```
 
 ## 恢复备份
 
@@ -216,6 +275,7 @@ sh init.sh restore
 
 ```sh
 sh init.sh status
+sh init.sh --debug-effective
 ```
 
 ## 安全提醒

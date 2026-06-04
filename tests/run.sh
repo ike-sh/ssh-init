@@ -658,6 +658,279 @@ MOCK_SYSTEMCTL
     rm -rf "$tmp"
 }
 
+make_mock_sshd_dropin_aware() {
+    bin_dir="$1"
+    cat > "$bin_dir/sshd" <<'MOCK_SSHD'
+#!/bin/sh
+mode=""
+config=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -T)
+            mode="T"
+            shift
+            ;;
+        -t)
+            mode="t"
+            shift
+            ;;
+        -f)
+            config="$2"
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+if [ "$mode" = "T" ]; then
+    pattern=$(awk 'tolower($1) == "include" { print $2; exit }' "$config")
+    dir=${pattern%/*}
+    if [ -f "$dir/00-ssh-init-hardening.conf" ]; then
+        printf '%s\n' "permitrootlogin without-password"
+        printf '%s\n' "pubkeyauthentication yes"
+        printf '%s\n' "passwordauthentication no"
+        printf '%s\n' "kbdinteractiveauthentication no"
+        printf '%s\n' "permitemptypasswords no"
+        printf '%s\n' "authenticationmethods any"
+        exit 0
+    fi
+    printf '%s\n' "permitrootlogin yes"
+    printf '%s\n' "pubkeyauthentication yes"
+    printf '%s\n' "passwordauthentication yes"
+    printf '%s\n' "kbdinteractiveauthentication no"
+    printf '%s\n' "permitemptypasswords no"
+    printf '%s\n' "authenticationmethods any"
+fi
+exit 0
+MOCK_SSHD
+    chmod +x "$bin_dir/sshd"
+}
+
+make_mock_restart_success() {
+    bin_dir="$1"
+    cat > "$bin_dir/systemctl" <<'MOCK_SYSTEMCTL'
+#!/bin/sh
+printf '%s\n' "restart" >> "$RESTART_LOG"
+exit 0
+MOCK_SYSTEMCTL
+    chmod +x "$bin_dir/systemctl"
+}
+
+test_dropin_permitrootlogin_success() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    old_ssh_config=$SSH_CONFIG
+    old_run_sshd_dir=$RUN_SSHD_DIR
+    mkdir -p "$tmp/bin" "$tmp/sshd_config.d"
+    SSH_CONFIG="$tmp/sshd_config"
+    RUN_SSHD_DIR="$tmp/run/sshd"
+    IKE_TEST_UID=0
+    export IKE_TEST_UID
+    {
+        printf '%s\n' "Include $tmp/sshd_config.d/*.conf"
+        printf '%s\n' "KbdInteractiveAuthentication no"
+    } > "$SSH_CONFIG"
+    printf '%s\n' "PermitRootLogin yes" > "$tmp/sshd_config.d/01-permitrootlogin.conf"
+    make_mock_sshd_dropin_aware "$tmp/bin"
+    make_mock_restart_success "$tmp/bin"
+    RESTART_LOG="$tmp/restart.log"
+    export RESTART_LOG
+    PATH="$tmp/bin:$PATH"
+    if harden_ssh_config > "$tmp/out" 2>&1 &&
+        [ -f "$tmp/sshd_config.d/00-ssh-init-hardening.conf" ] &&
+        grep -q '^PasswordAuthentication no$' "$tmp/sshd_config.d/00-ssh-init-hardening.conf" &&
+        grep -q '^PermitRootLogin prohibit-password$' "$tmp/sshd_config.d/00-ssh-init-hardening.conf" &&
+        grep -q '^PermitRootLogin yes$' "$tmp/sshd_config.d/01-permitrootlogin.conf" &&
+        [ -s "$RESTART_LOG" ]; then
+        pass "generic 00 drop-in overrides earlier PermitRootLogin drop-in"
+    else
+        fail "generic 00 drop-in overrides earlier PermitRootLogin drop-in"
+    fi
+    PATH=$old_path
+    SSH_CONFIG=$old_ssh_config
+    RUN_SSHD_DIR=$old_run_sshd_dir
+    unset IKE_TEST_UID RESTART_LOG
+    rm -rf "$tmp"
+}
+
+test_dropin_cloud_init_success() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    old_ssh_config=$SSH_CONFIG
+    old_run_sshd_dir=$RUN_SSHD_DIR
+    mkdir -p "$tmp/bin" "$tmp/sshd_config.d"
+    SSH_CONFIG="$tmp/sshd_config"
+    RUN_SSHD_DIR="$tmp/run/sshd"
+    IKE_TEST_UID=0
+    export IKE_TEST_UID
+    printf '%s\n' "Include $tmp/sshd_config.d/*.conf" > "$SSH_CONFIG"
+    printf '%s\n' "PasswordAuthentication yes" > "$tmp/sshd_config.d/50-cloud-init.conf"
+    make_mock_sshd_dropin_aware "$tmp/bin"
+    make_mock_restart_success "$tmp/bin"
+    RESTART_LOG="$tmp/restart.log"
+    export RESTART_LOG
+    PATH="$tmp/bin:$PATH"
+    if harden_ssh_config > "$tmp/out" 2>&1 &&
+        grep -q '^PasswordAuthentication no$' "$tmp/sshd_config.d/00-ssh-init-hardening.conf" &&
+        grep -q '^PasswordAuthentication yes$' "$tmp/sshd_config.d/50-cloud-init.conf" &&
+        grep -q "SSH 最终生效配置校验通过" "$tmp/out"; then
+        pass "00 drop-in wins before 50-cloud-init PasswordAuthentication"
+    else
+        fail "00 drop-in wins before 50-cloud-init PasswordAuthentication"
+    fi
+    PATH=$old_path
+    SSH_CONFIG=$old_ssh_config
+    RUN_SSHD_DIR=$old_run_sshd_dir
+    unset IKE_TEST_UID RESTART_LOG
+    rm -rf "$tmp"
+}
+
+test_existing_dropin_failure_restores_backup() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    old_ssh_config=$SSH_CONFIG
+    old_run_sshd_dir=$RUN_SSHD_DIR
+    mkdir -p "$tmp/bin" "$tmp/sshd_config.d"
+    SSH_CONFIG="$tmp/sshd_config"
+    RUN_SSHD_DIR="$tmp/run/sshd"
+    IKE_TEST_UID=0
+    export IKE_TEST_UID
+    printf '%s\n' "Include $tmp/sshd_config.d/*.conf" > "$SSH_CONFIG"
+    printf '%s\n' "old managed content" > "$tmp/sshd_config.d/00-ssh-init-hardening.conf"
+    cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
+#!/bin/sh
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "-T" ]; then
+        printf '%s\n' "permitrootlogin yes"
+        printf '%s\n' "pubkeyauthentication yes"
+        printf '%s\n' "passwordauthentication yes"
+        printf '%s\n' "kbdinteractiveauthentication no"
+        printf '%s\n' "permitemptypasswords no"
+        exit 0
+    fi
+    shift
+done
+exit 0
+MOCK_SSHD
+    make_mock_restart_success "$tmp/bin"
+    chmod +x "$tmp/bin/sshd"
+    RESTART_LOG="$tmp/restart.log"
+    export RESTART_LOG
+    PATH="$tmp/bin:$PATH"
+    if (harden_ssh_config > "$tmp/out" 2>&1); then
+        fail "existing 00 drop-in is restored after effective failure"
+    elif grep -q '^old managed content$' "$tmp/sshd_config.d/00-ssh-init-hardening.conf" &&
+        ! grep -q '^PasswordAuthentication no$' "$tmp/sshd_config.d/00-ssh-init-hardening.conf" &&
+        ! grep -q '^PasswordAuthentication no$' "$SSH_CONFIG" &&
+        [ "$(find "$tmp/sshd_config.d" -name '00-ssh-init-hardening.conf.bak.*' | wc -l | awk '{print $1}')" = "1" ] &&
+        [ ! -s "$RESTART_LOG" ]; then
+        pass "existing 00 drop-in is restored after effective failure"
+    else
+        fail "existing 00 drop-in is restored after effective failure"
+    fi
+    PATH=$old_path
+    SSH_CONFIG=$old_ssh_config
+    RUN_SSHD_DIR=$old_run_sshd_dir
+    unset IKE_TEST_UID RESTART_LOG
+    rm -rf "$tmp"
+}
+
+test_new_dropin_failure_removes_file() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    old_ssh_config=$SSH_CONFIG
+    old_run_sshd_dir=$RUN_SSHD_DIR
+    mkdir -p "$tmp/bin" "$tmp/sshd_config.d"
+    SSH_CONFIG="$tmp/sshd_config"
+    RUN_SSHD_DIR="$tmp/run/sshd"
+    IKE_TEST_UID=0
+    export IKE_TEST_UID
+    printf '%s\n' "Include $tmp/sshd_config.d/*.conf" > "$SSH_CONFIG"
+    cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
+#!/bin/sh
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "-T" ]; then
+        printf '%s\n' "permitrootlogin yes"
+        printf '%s\n' "pubkeyauthentication yes"
+        printf '%s\n' "passwordauthentication yes"
+        printf '%s\n' "kbdinteractiveauthentication no"
+        printf '%s\n' "permitemptypasswords no"
+        exit 0
+    fi
+    shift
+done
+exit 0
+MOCK_SSHD
+    make_mock_restart_success "$tmp/bin"
+    chmod +x "$tmp/bin/sshd"
+    RESTART_LOG="$tmp/restart.log"
+    export RESTART_LOG
+    PATH="$tmp/bin:$PATH"
+    if (harden_ssh_config > "$tmp/out" 2>&1); then
+        fail "new 00 drop-in is removed after effective failure"
+    elif [ ! -e "$tmp/sshd_config.d/00-ssh-init-hardening.conf" ] &&
+        ! grep -q '^PasswordAuthentication no$' "$SSH_CONFIG" &&
+        [ ! -s "$RESTART_LOG" ]; then
+        pass "new 00 drop-in is removed after effective failure"
+    else
+        fail "new 00 drop-in is removed after effective failure"
+    fi
+    PATH=$old_path
+    SSH_CONFIG=$old_ssh_config
+    RUN_SSHD_DIR=$old_run_sshd_dir
+    unset IKE_TEST_UID RESTART_LOG
+    rm -rf "$tmp"
+}
+
+test_effective_failure_lists_items() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    old_ssh_config=$SSH_CONFIG
+    old_run_sshd_dir=$RUN_SSHD_DIR
+    mkdir -p "$tmp/bin"
+    SSH_CONFIG="$tmp/sshd_config"
+    RUN_SSHD_DIR="$tmp/run/sshd"
+    IKE_TEST_UID=0
+    export IKE_TEST_UID
+    printf '%s\n' "PasswordAuthentication yes" > "$SSH_CONFIG"
+    cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
+#!/bin/sh
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "-T" ]; then
+        printf '%s\n' "permitrootlogin yes"
+        printf '%s\n' "passwordauthentication yes"
+        printf '%s\n' "pubkeyauthentication yes"
+        printf '%s\n' "kbdinteractiveauthentication no"
+        printf '%s\n' "permitemptypasswords no"
+        exit 0
+    fi
+    shift
+done
+exit 0
+MOCK_SSHD
+    make_mock_restart_success "$tmp/bin"
+    chmod +x "$tmp/bin/sshd"
+    RESTART_LOG="$tmp/restart.log"
+    export RESTART_LOG
+    PATH="$tmp/bin:$PATH"
+    if (harden_ssh_config > "$tmp/out" 2>&1); then
+        fail "effective failure output lists mismatched keys"
+    elif grep -q "passwordauthentication: 期望 no，实际 yes" "$tmp/out" &&
+        grep -q "permitrootlogin: 期望 prohibit-password/without-password，实际 yes" "$tmp/out" &&
+        grep -q "也可能是 Match 块根据用户、地址或组覆盖了全局配置" "$tmp/out" &&
+        [ ! -s "$RESTART_LOG" ]; then
+        pass "effective failure output lists mismatched keys"
+    else
+        fail "effective failure output lists mismatched keys"
+    fi
+    PATH=$old_path
+    SSH_CONFIG=$old_ssh_config
+    RUN_SSHD_DIR=$old_run_sshd_dir
+    unset IKE_TEST_UID RESTART_LOG
+    rm -rf "$tmp"
+}
+
 test_authentication_methods_blocks_hardening() {
     tmp=$(make_test_dir)
     old_ssh_config=$SSH_CONFIG
@@ -672,7 +945,7 @@ test_authentication_methods_blocks_hardening() {
         fail "AuthenticationMethods publickey,password blocks hardening"
     elif grep -q "AuthenticationMethods publickey,password" "$tmp/out" &&
         grep -q "继续可能导致 SSH 无法登录" "$tmp/out" &&
-        grep -q "改为 AuthenticationMethods publickey" "$tmp/out" &&
+        grep -q "AuthenticationMethods 改为 publickey" "$tmp/out" &&
         [ "$(find "$tmp" -name 'sshd_config.bak.*' | wc -l | awk '{print $1}')" = "0" ]; then
         pass "AuthenticationMethods publickey,password blocks hardening"
     else
@@ -680,6 +953,54 @@ test_authentication_methods_blocks_hardening() {
     fi
     SSH_CONFIG=$old_ssh_config
     unset IKE_TEST_UID
+    rm -rf "$tmp"
+}
+
+test_authentication_methods_keyboard_interactive_blocks_hardening() {
+    tmp=$(make_test_dir)
+    old_ssh_config=$SSH_CONFIG
+    mkdir -p "$tmp/sshd_config.d"
+    SSH_CONFIG="$tmp/sshd_config"
+    include="$tmp/sshd_config.d/auth.conf"
+    IKE_TEST_UID=0
+    export IKE_TEST_UID
+    printf '%s\n' "Include $tmp/sshd_config.d/*.conf" > "$SSH_CONFIG"
+    printf '%s\n' "AuthenticationMethods publickey,keyboard-interactive" > "$include"
+    if (harden_ssh_config > "$tmp/out" 2>&1); then
+        fail "AuthenticationMethods publickey,keyboard-interactive blocks hardening"
+    elif grep -q "AuthenticationMethods publickey,keyboard-interactive" "$tmp/out" &&
+        grep -q "脚本会禁用 password / keyboard-interactive" "$tmp/out" &&
+        [ ! -e "$tmp/sshd_config.d/00-ssh-init-hardening.conf" ] &&
+        [ "$(find "$tmp" -name 'sshd_config.bak.*' | wc -l | awk '{print $1}')" = "0" ]; then
+        pass "AuthenticationMethods publickey,keyboard-interactive blocks hardening"
+    else
+        fail "AuthenticationMethods publickey,keyboard-interactive blocks hardening"
+    fi
+    SSH_CONFIG=$old_ssh_config
+    unset IKE_TEST_UID
+    rm -rf "$tmp"
+}
+
+test_authentication_methods_safe_values_allowed() {
+    tmp=$(make_test_dir)
+    old_ssh_config=$SSH_CONFIG
+    SSH_CONFIG="$tmp/sshd_config"
+    printf '%s\n' "AuthenticationMethods any" > "$SSH_CONFIG"
+    any_ok=0
+    publickey_ok=0
+    if detect_authentication_methods_risk "$SSH_CONFIG"; then
+        any_ok=1
+    fi
+    printf '%s\n' "AuthenticationMethods publickey" > "$SSH_CONFIG"
+    if detect_authentication_methods_risk "$SSH_CONFIG"; then
+        publickey_ok=1
+    fi
+    if [ "$any_ok" = "1" ] && [ "$publickey_ok" = "1" ]; then
+        pass "AuthenticationMethods any and publickey are allowed"
+    else
+        fail "AuthenticationMethods any and publickey are allowed"
+    fi
+    SSH_CONFIG=$old_ssh_config
     rm -rf "$tmp"
 }
 
@@ -814,7 +1135,7 @@ MOCK_SYSTEMCTL
     if (harden_ssh_config > "$tmp/out" 2>&1); then
         fail "sshd -T failure restores backup"
     elif grep -q '^PasswordAuthentication yes$' "$SSH_CONFIG" &&
-        grep -q "最终生效配置不符合预期" "$tmp/out" &&
+        grep -q "sshd -T 无法读取最终配置" "$tmp/out" &&
         [ ! -s "$RESTART_LOG" ]; then
         pass "sshd -T failure restores backup"
     else
@@ -1361,6 +1682,15 @@ test_cli_status_parsing() {
     fi
 }
 
+test_cli_debug_effective_parsing() {
+    if parse_cli_args --debug-effective &&
+        [ "$CLI_MODE" = "debug-effective" ]; then
+        pass "CLI --debug-effective parsing"
+    else
+        fail "CLI --debug-effective parsing"
+    fi
+}
+
 test_menu_output() {
     tmp=$(make_test_dir)
     show_menu > "$tmp/menu"
@@ -1371,6 +1701,50 @@ test_menu_output() {
     else
         fail "no-arg menu function"
     fi
+    rm -rf "$tmp"
+}
+
+test_debug_effective_outputs_report_without_config_d() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    old_ssh_config=$SSH_CONFIG
+    old_run_sshd_dir=$RUN_SSHD_DIR
+    mkdir -p "$tmp/bin"
+    SSH_CONFIG="$tmp/sshd_config"
+    RUN_SSHD_DIR="$tmp/run/sshd"
+    {
+        printf '%s\n' "PasswordAuthentication yes"
+        printf '%s\n' "PermitRootLogin yes"
+    } > "$SSH_CONFIG"
+    before=$(cat "$SSH_CONFIG")
+    cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
+#!/bin/sh
+if [ "$1" = "-T" ]; then
+    printf '%s\n' "pubkeyauthentication yes"
+    printf '%s\n' "passwordauthentication yes"
+    printf '%s\n' "kbdinteractiveauthentication no"
+    printf '%s\n' "permitemptypasswords no"
+    printf '%s\n' "permitrootlogin yes"
+    printf '%s\n' "authenticationmethods any"
+fi
+exit 0
+MOCK_SSHD
+    chmod +x "$tmp/bin/sshd"
+    PATH="$tmp/bin:$PATH"
+    if IKE_TEST_MODE=0 SSH_CONFIG="$SSH_CONFIG" RUN_SSHD_DIR="$RUN_SSHD_DIR" PATH="$PATH" sh "$ROOT_DIR/init.sh" --debug-effective > "$tmp/out" 2>&1 &&
+        grep -q "SSH 最终生效配置诊断" "$tmp/out" &&
+        grep -q "sshd 路径: $tmp/bin/sshd" "$tmp/out" &&
+        grep -q "passwordauthentication yes" "$tmp/out" &&
+        grep -q "1:PasswordAuthentication yes" "$tmp/out" &&
+        [ "$(cat "$SSH_CONFIG")" = "$before" ] &&
+        [ "$(find "$tmp" -name 'sshd_config.bak.*' | wc -l | awk '{print $1}')" = "0" ]; then
+        pass "--debug-effective reports final values without modifying config"
+    else
+        fail "--debug-effective reports final values without modifying config"
+    fi
+    PATH=$old_path
+    SSH_CONFIG=$old_ssh_config
+    RUN_SSHD_DIR=$old_run_sshd_dir
     rm -rf "$tmp"
 }
 
@@ -1466,7 +1840,14 @@ test_sshd_config_writer_only_changes_allowed_keys
 test_sshd_t_failure_restores_backup
 test_restart_failure_restores_backup
 test_effective_include_password_yes_fails
+test_dropin_permitrootlogin_success
+test_dropin_cloud_init_success
+test_existing_dropin_failure_restores_backup
+test_new_dropin_failure_removes_file
+test_effective_failure_lists_items
 test_authentication_methods_blocks_hardening
+test_authentication_methods_keyboard_interactive_blocks_hardening
+test_authentication_methods_safe_values_allowed
 test_match_password_yes_warns_and_preserves
 test_atomic_write_failure_restores_backup
 test_effective_sshd_T_failure_restores_backup
@@ -1494,9 +1875,11 @@ test_cli_keys_parsing
 test_cli_keygen_parsing
 test_cli_restore_parsing
 test_cli_status_parsing
+test_cli_debug_effective_parsing
 test_menu_output
 test_color_output
 test_status_output
+test_debug_effective_outputs_report_without_config_d
 test_restore_authorized_keys_message
 test_no_forbidden_features
 

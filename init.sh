@@ -19,6 +19,8 @@ LOCAL_SSH_DIR=""
 SSHD_CONFIG_WAS_IMMUTABLE=0
 SSHD_CONFIG_TMP_FILE=""
 SSH_KEYGEN_WARNED=0
+SSHD_EFFECTIVE_KEYS_RE='^(pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|permitemptypasswords|permitrootlogin|authenticationmethods) '
+SSHD_SOURCE_GREP_RE='^[[:space:]]*(Include|PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|PermitEmptyPasswords|PermitRootLogin|PubkeyAuthentication|AuthenticationMethods|Match)([[:space:]]|$)'
 
 BLUE=$(printf '\033[34m')
 GREEN=$(printf '\033[32m')
@@ -831,11 +833,31 @@ validate_sshd_config() {
 
 effective_sshd_settings_check() {
     config_file="$1"
-    ensure_run_sshd_dir || return 1
+    failures_file="${2:-}"
+    if [ -n "$failures_file" ]; then
+        : > "$failures_file" || return 1
+    fi
+    if ! ensure_run_sshd_dir; then
+        if [ -n "$failures_file" ]; then
+            printf '%s\n' "__SSHD_T_FAILED__" > "$failures_file" || true
+        fi
+        return 1
+    fi
     sshd_bin=$(find_sshd_bin 2>/dev/null || true)
-    [ -n "$sshd_bin" ] || return 1
+    if [ -z "$sshd_bin" ]; then
+        if [ -n "$failures_file" ]; then
+            printf '%s\n' "__SSHD_T_FAILED__" > "$failures_file" || true
+        fi
+        return 1
+    fi
     effective_file=$(make_tmp_file "sshd-effective")
-    "$sshd_bin" -T -f "$config_file" > "$effective_file" 2>/dev/null || return 1
+    if ! "$sshd_bin" -T -f "$config_file" > "$effective_file" 2>/dev/null; then
+        if [ -n "$failures_file" ]; then
+            printf '%s\n' "__SSHD_T_FAILED__" > "$failures_file" || true
+        fi
+        return 1
+    fi
+    detected_failures=$(make_tmp_file "sshd-effective-failures")
     awk '
         {
             key = tolower($1)
@@ -844,18 +866,48 @@ effective_sshd_settings_check() {
             values[key] = value
         }
         END {
-            ok = 1
-            if (seen["pubkeyauthentication"] && values["pubkeyauthentication"] != "yes") ok = 0
-            if (seen["passwordauthentication"] && values["passwordauthentication"] != "no") ok = 0
-            if (seen["kbdinteractiveauthentication"] && values["kbdinteractiveauthentication"] != "no") ok = 0
-            if (seen["permitemptypasswords"] && values["permitemptypasswords"] != "no") ok = 0
-            if (seen["challengeresponseauthentication"] && values["challengeresponseauthentication"] != "no") ok = 0
+            if (seen["pubkeyauthentication"] && values["pubkeyauthentication"] != "yes")
+                print "  - pubkeyauthentication: 期望 yes，实际 " values["pubkeyauthentication"]
+            if (seen["passwordauthentication"] && values["passwordauthentication"] != "no")
+                print "  - passwordauthentication: 期望 no，实际 " values["passwordauthentication"]
+            if (seen["kbdinteractiveauthentication"] && values["kbdinteractiveauthentication"] != "no")
+                print "  - kbdinteractiveauthentication: 期望 no，实际 " values["kbdinteractiveauthentication"]
+            if (seen["permitemptypasswords"] && values["permitemptypasswords"] != "no")
+                print "  - permitemptypasswords: 期望 no，实际 " values["permitemptypasswords"]
+            if (seen["challengeresponseauthentication"] && values["challengeresponseauthentication"] != "no")
+                print "  - challengeresponseauthentication: 期望 no，实际 " values["challengeresponseauthentication"]
             if (seen["permitrootlogin"] &&
                 values["permitrootlogin"] != "prohibit-password" &&
-                values["permitrootlogin"] != "without-password") ok = 0
-            exit ok ? 0 : 1
+                values["permitrootlogin"] != "without-password")
+                print "  - permitrootlogin: 期望 prohibit-password/without-password，实际 " values["permitrootlogin"]
         }
-    ' "$effective_file"
+    ' "$effective_file" > "$detected_failures"
+    if [ -s "$detected_failures" ]; then
+        if [ -n "$failures_file" ]; then
+            cat "$detected_failures" > "$failures_file" || true
+        fi
+        return 1
+    fi
+    return 0
+}
+
+print_effective_sshd_settings_failure() {
+    failures_file="$1"
+    if [ -f "$failures_file" ] && grep -qx "__SSHD_T_FAILED__" "$failures_file"; then
+        error "sshd -T 无法读取最终配置"
+        return 0
+    fi
+    error "配置语法通过，但最终生效配置不符合预期："
+    if [ -f "$failures_file" ] && [ -s "$failures_file" ]; then
+        cat "$failures_file" >&2
+    else
+        printf '%s\n' "  - 未能解析最终生效配置，请手动运行 sshd -T 排查。" >&2
+    fi
+    print_blank >&2
+    printf '%s\n' "可能原因：" >&2
+    printf '%s\n' "  - /etc/ssh/sshd_config.d/*.conf 中有更早加载的配置" >&2
+    printf '%s\n' "  - 也可能是 Match 块根据用户、地址或组覆盖了全局配置。" >&2
+    printf '%s\n' "  - 当前 OpenSSH 默认值仍允许密码登录" >&2
 }
 
 ssh_init_dirname() {
@@ -891,23 +943,33 @@ list_path_matches() {
     fi
 }
 
+list_resolved_include_patterns() {
+    pattern="$1"
+    current_dir="$2"
+    case "$pattern" in
+        /*)
+            printf '%s\n' "$pattern"
+            ;;
+        *)
+            printf '%s\n' "/etc/ssh/$pattern"
+            if [ "$current_dir" != "/etc/ssh" ]; then
+                printf '%s\n' "$current_dir/$pattern"
+            fi
+            ;;
+    esac
+}
+
 list_include_matches() {
     pattern="$1"
     current_dir="$2"
     if [ -z "$pattern" ]; then
         return 0
     fi
-    case "$pattern" in
-        /*)
-            list_path_matches "$pattern"
-            ;;
-        *)
-            list_path_matches "/etc/ssh/$pattern"
-            if [ "$current_dir" != "/etc/ssh" ]; then
-                list_path_matches "$current_dir/$pattern"
-            fi
-            ;;
-    esac
+    resolved_file=$(make_tmp_file "sshd-resolved-includes")
+    list_resolved_include_patterns "$pattern" "$current_dir" > "$resolved_file"
+    while IFS= read -r resolved || [ -n "$resolved" ]; do
+        list_path_matches "$resolved"
+    done < "$resolved_file"
 }
 
 config_file_include_patterns() {
@@ -1091,6 +1153,88 @@ make_sshd_config_tmp_file() {
     printf '%s\n' "$tmp_file"
 }
 
+sshd_dropin_dir_from_config() {
+    file="$1"
+    [ -f "$file" ] || return 1
+    current_dir=$(ssh_init_dirname "$file")
+    patterns_file=$(make_tmp_file "sshd-dropin-patterns")
+    config_file_include_patterns "$file" > "$patterns_file" || return 1
+    while IFS= read -r pattern || [ -n "$pattern" ]; do
+        resolved_file=$(make_tmp_file "sshd-dropin-resolved")
+        list_resolved_include_patterns "$pattern" "$current_dir" > "$resolved_file"
+        while IFS= read -r resolved || [ -n "$resolved" ]; do
+            dir=$(ssh_init_dirname "$resolved")
+            base=${resolved##*/}
+            case "$dir" in
+                */sshd_config.d)
+                    ;;
+                *)
+                    continue
+                    ;;
+            esac
+            case "$base" in
+                *.conf)
+                    ;;
+                *)
+                    continue
+                    ;;
+            esac
+            [ -d "$dir" ] || continue
+            printf '%s\n' "$dir"
+            return 0
+        done < "$resolved_file"
+    done < "$patterns_file"
+    return 1
+}
+
+sshd_hardening_dropin_path() {
+    dropin_dir=$(sshd_dropin_dir_from_config "$1" 2>/dev/null || true)
+    [ -n "$dropin_dir" ] || return 1
+    printf '%s\n' "$dropin_dir/00-ssh-init-hardening.conf"
+}
+
+write_sshd_hardening_dropin_content() {
+    output="$1"
+    cat > "$output" <<'EOF'
+# Managed by ssh-init. Do not edit manually unless you know what you are doing.
+PubkeyAuthentication yes
+PasswordAuthentication no
+ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+PermitRootLogin prohibit-password
+EOF
+}
+
+write_sshd_hardening_dropin() {
+    dropin_file="$1"
+    tmp_file=$(make_sshd_config_tmp_file "$dropin_file" 2>/dev/null || true)
+    if [ -z "$tmp_file" ]; then
+        return 1
+    fi
+    if ! write_sshd_hardening_dropin_content "$tmp_file"; then
+        safe_rm_f "$tmp_file" || true
+        SSHD_CONFIG_TMP_FILE=""
+        return 1
+    fi
+    if ! set_owner "$tmp_file" "root:root"; then
+        safe_rm_f "$tmp_file" || true
+        SSHD_CONFIG_TMP_FILE=""
+        return 1
+    fi
+    if ! chmod 644 "$tmp_file"; then
+        safe_rm_f "$tmp_file" || true
+        SSHD_CONFIG_TMP_FILE=""
+        return 1
+    fi
+    if ! mv -f "$tmp_file" "$dropin_file"; then
+        safe_rm_f "$tmp_file" || true
+        SSHD_CONFIG_TMP_FILE=""
+        return 1
+    fi
+    SSHD_CONFIG_TMP_FILE=""
+}
+
 restart_ssh_service() {
     ensure_run_sshd_dir || return 1
     if command -v systemctl >/dev/null 2>&1; then
@@ -1196,6 +1340,37 @@ restore_sshd_backup() {
     cp -p "$backup" "$SSH_CONFIG"
 }
 
+restore_sshd_dropin_backup() {
+    dropin_file="$1"
+    dropin_backup="$2"
+    dropin_existed="$3"
+    [ -n "$dropin_file" ] || return 0
+    if [ "$dropin_existed" = "1" ]; then
+        [ -f "$dropin_backup" ] || return 1
+        cp -p "$dropin_backup" "$dropin_file"
+    else
+        safe_rm_f "$dropin_file"
+    fi
+}
+
+rollback_sshd_hardening() {
+    backup="$1"
+    dropin_file="$2"
+    dropin_backup="$3"
+    dropin_existed="$4"
+    rollback_failed=0
+    if ! restore_sshd_backup "$backup"; then
+        error "恢复 sshd_config 备份失败: $backup"
+        rollback_failed=1
+    fi
+    if ! restore_sshd_dropin_backup "$dropin_file" "$dropin_backup" "$dropin_existed"; then
+        error "恢复 SSH drop-in 加固文件失败: $dropin_file"
+        rollback_failed=1
+    fi
+    relock_immutable_if_needed "$SSH_CONFIG"
+    [ "$rollback_failed" = "0" ]
+}
+
 warn_match_override_risk() {
     warn "检测到 Match 块可能覆盖全局 SSH 安全策略，请确认特定用户/地址仍允许密码登录是否符合预期。"
     if [ -n "${MATCH_OVERRIDE_RISK:-}" ]; then
@@ -1208,8 +1383,9 @@ harden_ssh_config() {
     [ -f "$SSH_CONFIG" ] || die "找不到 SSH 配置文件: $SSH_CONFIG"
     if ! detect_authentication_methods_risk "$SSH_CONFIG"; then
         auth_methods=$(printf '%s\n' "$AUTHENTICATION_METHODS_RISK" | sed 's/^.*: AuthenticationMethods //')
-        error "当前配置要求多因素认证 AuthenticationMethods $auth_methods，但脚本会禁用 password，继续可能导致 SSH 无法登录。"
-        error "请手动修复：改为 AuthenticationMethods publickey，或先删除该项后重试。"
+        error "当前 SSH 配置要求多因素认证 AuthenticationMethods $auth_methods 或 keyboard-interactive。"
+        error "脚本会禁用 password / keyboard-interactive，继续可能导致 SSH 无法登录。"
+        error "请先将 AuthenticationMethods 改为 publickey，或删除该项后重试。"
         exit 1
     fi
     match_override_warned=0
@@ -1217,66 +1393,87 @@ harden_ssh_config() {
         match_override_warned=1
         warn_match_override_risk
     fi
-    backup="$SSH_CONFIG.bak.$(timestamp)"
+    stamp=$(timestamp)
+    backup="$SSH_CONFIG.bak.$stamp"
+    dropin_file=$(sshd_hardening_dropin_path "$SSH_CONFIG" 2>/dev/null || true)
+    dropin_backup=""
+    dropin_existed=0
     tmp_file=""
     info "正在修改 sshd_config..."
     cp -p "$SSH_CONFIG" "$backup" || die "备份 sshd_config 失败。"
     success "已备份 sshd_config: $backup"
     unlock_immutable_if_needed "$SSH_CONFIG"
+    if [ -n "$dropin_file" ]; then
+        info "检测到 sshd_config.d Include，将优先写入: $dropin_file"
+        if [ -f "$dropin_file" ]; then
+            dropin_existed=1
+            dropin_backup="$dropin_file.bak.$stamp"
+            if ! cp -p "$dropin_file" "$dropin_backup"; then
+                restore_sshd_backup "$backup" || true
+                relock_immutable_if_needed "$SSH_CONFIG"
+                die "备份 SSH drop-in 加固文件失败，已恢复备份。"
+            fi
+            success "已备份 SSH drop-in 加固文件: $dropin_backup"
+        else
+            info "将新建 SSH drop-in 加固文件: $dropin_file"
+        fi
+    fi
     tmp_file=$(make_sshd_config_tmp_file "$SSH_CONFIG" 2>/dev/null || true)
     if [ -z "$tmp_file" ]; then
-        restore_sshd_backup "$backup" || true
-        relock_immutable_if_needed "$SSH_CONFIG"
+        rollback_sshd_hardening "$backup" "$dropin_file" "$dropin_backup" "$dropin_existed" || true
         die "创建 SSH 配置临时文件失败，已恢复备份。"
     fi
     if ! cp -p "$SSH_CONFIG" "$tmp_file"; then
         safe_rm_f "$tmp_file" || true
         SSHD_CONFIG_TMP_FILE=""
-        restore_sshd_backup "$backup" || true
-        relock_immutable_if_needed "$SSH_CONFIG"
+        rollback_sshd_hardening "$backup" "$dropin_file" "$dropin_backup" "$dropin_existed" || true
         die "准备 SSH 配置临时文件失败，已恢复备份。"
     fi
     if ! write_hardened_sshd_config "$SSH_CONFIG" "$tmp_file"; then
         safe_rm_f "$tmp_file" || true
         SSHD_CONFIG_TMP_FILE=""
-        restore_sshd_backup "$backup" || true
-        relock_immutable_if_needed "$SSH_CONFIG"
+        rollback_sshd_hardening "$backup" "$dropin_file" "$dropin_backup" "$dropin_existed" || true
         die "生成 SSH 配置失败，已恢复备份。"
     fi
     if ! validate_sshd_config_file "$tmp_file"; then
         safe_rm_f "$tmp_file" || true
         SSHD_CONFIG_TMP_FILE=""
-        restore_sshd_backup "$backup" || true
-        relock_immutable_if_needed "$SSH_CONFIG"
+        rollback_sshd_hardening "$backup" "$dropin_file" "$dropin_backup" "$dropin_existed" || true
         die "sshd -t 校验失败，已恢复备份。"
     fi
     if ! mv -f "$tmp_file" "$SSH_CONFIG"; then
         safe_rm_f "$tmp_file" || true
         SSHD_CONFIG_TMP_FILE=""
-        restore_sshd_backup "$backup" || true
-        relock_immutable_if_needed "$SSH_CONFIG"
+        rollback_sshd_hardening "$backup" "$dropin_file" "$dropin_backup" "$dropin_existed" || true
         die "写入 SSH 配置失败，已恢复备份。"
     fi
     SSHD_CONFIG_TMP_FILE=""
 
+    if [ -n "$dropin_file" ]; then
+        if ! write_sshd_hardening_dropin "$dropin_file"; then
+            rollback_sshd_hardening "$backup" "$dropin_file" "$dropin_backup" "$dropin_existed" || true
+            die "写入 SSH drop-in 加固文件失败，已恢复备份。"
+        fi
+        success "SSH drop-in 加固文件已写入: $dropin_file"
+    fi
+
     if ! validate_sshd_config; then
-        restore_sshd_backup "$backup" || true
-        relock_immutable_if_needed "$SSH_CONFIG"
+        rollback_sshd_hardening "$backup" "$dropin_file" "$dropin_backup" "$dropin_existed" || true
         die "sshd -t 校验失败，已恢复备份。"
     fi
     success "SSH 配置校验通过"
-    if ! effective_sshd_settings_check "$SSH_CONFIG"; then
-        restore_sshd_backup "$backup" || true
-        relock_immutable_if_needed "$SSH_CONFIG"
-        die "配置语法通过，但最终生效配置不符合预期，可能被 Include 或 Match 覆盖。"
+    effective_failures=$(make_tmp_file "sshd-effective-check")
+    if ! effective_sshd_settings_check "$SSH_CONFIG" "$effective_failures"; then
+        print_effective_sshd_settings_failure "$effective_failures"
+        rollback_sshd_hardening "$backup" "$dropin_file" "$dropin_backup" "$dropin_existed" || true
+        die "已恢复 SSH 配置，未重启 SSH 服务。"
     fi
     success "SSH 最终生效配置校验通过"
 
     if ! restart_ssh_service; then
         warn "SSH 服务重启失败，正在恢复备份..."
-        restore_sshd_backup "$backup" || true
+        rollback_sshd_hardening "$backup" "$dropin_file" "$dropin_backup" "$dropin_existed" || true
         restart_ssh_service >/dev/null 2>&1 || true
-        relock_immutable_if_needed "$SSH_CONFIG"
         die "SSH 服务重启失败，已尝试恢复备份。请通过 VNC/Console 检查。"
     fi
     relock_immutable_if_needed "$SSH_CONFIG"
@@ -1355,16 +1552,52 @@ list_backups() {
 }
 
 show_effective_ssh_config() {
-    if command -v sshd >/dev/null 2>&1; then
-        sshd -T 2>/dev/null | grep -Ei '^(port|permitrootlogin|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|permitemptypasswords)' || true
-    elif [ -x /usr/sbin/sshd ]; then
-        /usr/sbin/sshd -T 2>/dev/null | grep -Ei '^(port|permitrootlogin|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|permitemptypasswords)' || true
-    fi
+    sshd_bin=$(find_sshd_bin 2>/dev/null || true)
+    [ -n "$sshd_bin" ] || return 0
+    "$sshd_bin" -T -f "$SSH_CONFIG" 2>/dev/null | grep -Ei "^(port|permitrootlogin|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|permitemptypasswords|authenticationmethods) " || true
 }
 
 get_effective_sshd_value() {
     key="$1"
     show_effective_ssh_config | awk -v k="$key" 'tolower($1) == tolower(k) { print $2; exit }'
+}
+
+debug_effective_config() {
+    sshd_bin=$(find_sshd_bin 2>/dev/null || true)
+    print_blank
+    print_section_title "SSH 最终生效配置诊断"
+    if [ -n "$sshd_bin" ]; then
+        printf '%s\n' "sshd 路径: $sshd_bin"
+    else
+        printf '%s\n' "sshd 路径: 未找到"
+    fi
+    printf '%s\n' "配置文件: $SSH_CONFIG"
+    print_blank
+
+    printf '%s\n' "[最终生效关键项]"
+    if [ -n "$sshd_bin" ]; then
+        effective_file=$(make_tmp_file "sshd-debug-effective")
+        if "$sshd_bin" -T -f "$SSH_CONFIG" > "$effective_file" 2>/dev/null; then
+            if ! grep -Ei "$SSHD_EFFECTIVE_KEYS_RE" "$effective_file"; then
+                printf '%s\n' "(未输出相关关键项)"
+            fi
+        else
+            printf '%s\n' "sshd -T 无法读取最终配置"
+        fi
+    else
+        printf '%s\n' "sshd -T 无法读取最终配置"
+    fi
+    print_blank
+
+    printf '%s\n' "[相关来源行]"
+    config_dir=$(ssh_init_dirname "$SSH_CONFIG")
+    source_dir="$config_dir/sshd_config.d"
+    if [ -d "$source_dir" ]; then
+        grep -RInE "$SSHD_SOURCE_GREP_RE" "$SSH_CONFIG" "$source_dir" 2>/dev/null || printf '%s\n' "(未找到相关来源行)"
+    else
+        grep -RInE "$SSHD_SOURCE_GREP_RE" "$SSH_CONFIG" 2>/dev/null || printf '%s\n' "(未找到相关来源行)"
+    fi
+    print_section_end
 }
 
 show_authorized_keys_summary() {
@@ -1671,6 +1904,7 @@ usage() {
   sh init.sh keygen
   sh init.sh restore
   sh init.sh status
+  sh init.sh --debug-effective
 EOF
 }
 
@@ -1707,6 +1941,10 @@ parse_cli_args() {
         status)
             [ "$#" -eq 1 ] || return 1
             CLI_MODE="status"
+            ;;
+        --debug-effective)
+            [ "$#" -eq 1 ] || return 1
+            CLI_MODE="debug-effective"
             ;;
         -h|--help)
             CLI_MODE="help"
@@ -1748,6 +1986,9 @@ main() {
             ;;
         status)
             show_status
+            ;;
+        debug-effective)
+            debug_effective_config
             ;;
         help)
             usage
