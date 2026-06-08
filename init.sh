@@ -371,7 +371,11 @@ fetch_github_keys() {
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL --connect-timeout 10 "$url" > "$output_file" || return 1
     elif command -v wget >/dev/null 2>&1; then
-        wget -qO- "$url" > "$output_file" || return 1
+        if wget --help 2>&1 | grep -qE '(^|[[:space:]])--timeout'; then
+            wget -qO- --timeout=10 "$url" > "$output_file" || return 1
+        else
+            wget -qO- -T 10 "$url" > "$output_file" || return 1
+        fi
     else
         error "缺少 curl 或 wget，无法拉取 GitHub 公钥。"
         return 1
@@ -751,7 +755,7 @@ generate_ed25519_key_pair() {
     info "正在生成 Ed25519 密钥对..."
     ssh-keygen -q -t ed25519 -N "" -f "$GENERATED_PRIVATE_KEY_FILE" -C "ssh-init-generated" >/dev/null 2>&1 || die "生成 SSH 密钥失败。"
     chmod 600 "$GENERATED_PRIVATE_KEY_FILE" 2>/dev/null || true
-    chmod 600 "$GENERATED_PUBLIC_KEY_FILE" 2>/dev/null || true
+    chmod 644 "$GENERATED_PUBLIC_KEY_FILE" 2>/dev/null || true
 }
 
 print_generated_public_key() {
@@ -1013,7 +1017,7 @@ config_file_authentication_methods_risk() {
                 in_match = 1
                 next
             }
-            if (!in_match && key == "authenticationmethods") {
+            if (key == "authenticationmethods") {
                 value = ""
                 for (i = 2; i <= n; i++) {
                     value = value (value == "" ? "" : " ") parts[i]
@@ -1516,6 +1520,36 @@ latest_authorized_keys_backup() {
     latest_matching_file "$auth_file.bak.*"
 }
 
+latest_dropin_backup() {
+    dropin_file=$(sshd_hardening_dropin_path "$SSH_CONFIG" 2>/dev/null || true)
+    [ -n "$dropin_file" ] || return 1
+    latest_matching_file "$dropin_file.bak.*"
+}
+
+is_managed_ssh_init_dropin() {
+    file="$1"
+    [ -f "$file" ] || return 1
+    grep -Fq 'Managed by ssh-init' "$file" 2>/dev/null
+}
+
+restore_sshd_dropin_from_backup_or_remove() {
+    dropin_file=$(sshd_hardening_dropin_path "$SSH_CONFIG" 2>/dev/null || true)
+    [ -n "$dropin_file" ] || return 0
+
+    dropin_backup=$(latest_dropin_backup 2>/dev/null || true)
+    if [ -n "$dropin_backup" ] && [ -f "$dropin_backup" ]; then
+        cp -p "$dropin_backup" "$dropin_file" || return 1
+        success "已恢复 SSH drop-in: $dropin_file"
+        return 0
+    fi
+
+    if is_managed_ssh_init_dropin "$dropin_file"; then
+        safe_rm_f "$dropin_file" || return 1
+        success "已移除 ssh-init 创建的 drop-in: $dropin_file"
+    fi
+    return 0
+}
+
 list_matching_files_reverse() {
     pattern="$1"
     # shellcheck disable=SC2086
@@ -1549,6 +1583,18 @@ list_backups() {
         printf '%s\n' "(无)"
     fi
     print_blank
+
+    dropin_file=$(sshd_hardening_dropin_path "$SSH_CONFIG" 2>/dev/null || true)
+    if [ -n "$dropin_file" ]; then
+        printf '%s\n' "[可用 SSH drop-in 备份]"
+        files=$(list_matching_files_reverse "$dropin_file.bak.*")
+        if [ -n "$files" ]; then
+            printf '%s\n' "$files" | awk '{print NR ") " $0}'
+        else
+            printf '%s\n' "(无)"
+        fi
+        print_blank
+    fi
 }
 
 show_effective_ssh_config() {
@@ -1632,6 +1678,12 @@ restore_sshd_config_from_backup() {
         relock_immutable_if_needed "$SSH_CONFIG"
         return 1
     fi
+    if ! restore_sshd_dropin_from_backup_or_remove; then
+        cp -p "$before" "$SSH_CONFIG" || true
+        relock_immutable_if_needed "$SSH_CONFIG"
+        error "恢复 SSH drop-in 失败，已还原当前配置。"
+        return 1
+    fi
     if ! validate_sshd_config; then
         cp -p "$before" "$SSH_CONFIG" || true
         relock_immutable_if_needed "$SSH_CONFIG"
@@ -1654,6 +1706,41 @@ restore_sshd_config_from_backup() {
     [ -n "$password_auth" ] && info "当前 PasswordAuthentication: $password_auth"
     [ -n "$permit_root" ] && info "当前 PermitRootLogin: $permit_root"
     return 0
+}
+
+restore_sshd_and_authorized_keys_from_backups() {
+    ssh_backup="$1"
+    auth_backup="$2"
+    auth_file=$(current_auth_file)
+    ssh_before=""
+    auth_before=""
+    stamp=$(timestamp)
+
+    if [ -f "$SSH_CONFIG" ]; then
+        ssh_before="$SSH_CONFIG.before-both-restore.$stamp"
+        cp -p "$SSH_CONFIG" "$ssh_before" || return 1
+    fi
+    if [ -f "$auth_file" ]; then
+        auth_before="$auth_file.before-both-restore.$stamp"
+        cp -p "$auth_file" "$auth_before" || return 1
+    fi
+
+    if ! restore_sshd_config_from_backup "$ssh_backup"; then
+        return 1
+    fi
+    if restore_authorized_keys_from_backup "$auth_backup"; then
+        info "请新开终端测试 SSH 登录是否恢复正常。"
+        return 0
+    fi
+
+    warn "authorized_keys 恢复失败，正在回滚 sshd_config..."
+    if [ -n "$ssh_before" ] && [ -f "$ssh_before" ]; then
+        restore_sshd_config_from_backup "$ssh_before" || warn "sshd_config 回滚失败，请手动检查。"
+    fi
+    if [ -n "$auth_before" ] && [ -f "$auth_before" ]; then
+        cp -p "$auth_before" "$auth_file" || warn "authorized_keys 回滚失败，请手动检查。"
+    fi
+    return 1
 }
 
 restore_authorized_keys_from_backup() {
@@ -1762,7 +1849,7 @@ EOF
         3)
             ssh_backup=$(latest_sshd_backup 2>/dev/null || true)
             auth_backup=$(latest_authorized_keys_backup 2>/dev/null || true)
-            restore_sshd_config_from_backup "$ssh_backup" && restore_authorized_keys_from_backup "$auth_backup" && info "请新开终端测试 SSH 登录是否恢复正常。"
+            restore_sshd_and_authorized_keys_from_backups "$ssh_backup" "$auth_backup"
             ;;
         4)
             show_status

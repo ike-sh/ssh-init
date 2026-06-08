@@ -1,0 +1,22 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  shellcheck-and-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Shellcheck init.sh
+        run: shellcheck -e SC2034,SC2086,SC2012 init.sh
+
+      - name: Run test suite
+        run: sh tests/run.sh

@@ -17,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/ike-sh/ssh-init/main/init.sh -o ini
 如果你想固定行为、不受 `main` 更新影响，可以使用 tag 版本。生产环境更建议固定 tag；普通用户可以直接用 `main`。
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ike-sh/ssh-init/v0.5.2/init.sh -o init.sh && sh init.sh
+curl -fsSL https://raw.githubusercontent.com/ike-sh/ssh-init/v0.5.6/init.sh -o init.sh && sh init.sh
 ```
 
 运行后会看到：
@@ -250,6 +250,8 @@ sh init.sh
 ```
 
 恢复菜单可以恢复最新的 `sshd_config` 备份、最新的 `authorized_keys` 备份，或同时恢复二者。恢复 `sshd_config` 后脚本会再次执行 `sshd -t` 并重启 SSH 服务。
+
+如果加固时写入了 `/etc/ssh/sshd_config.d/00-ssh-init-hardening.conf`，恢复 `sshd_config` 时会同步处理该 drop-in 文件：有备份则恢复备份内容；若该文件是脚本新建且没有备份，则会移除该托管 drop-in 文件，避免主配置恢复后仍被 drop-in 保持加固状态。
 
 “恢复最新备份”表示恢复到脚本上次修改前的状态。`authorized_keys` 恢复不是清空文件，而是恢复备份文件内容；如果恢复后仍有公钥行，说明备份中本来就有这些公钥。
 

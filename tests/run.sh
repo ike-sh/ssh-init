@@ -1148,6 +1148,214 @@ MOCK_SYSTEMCTL
     rm -rf "$tmp"
 }
 
+test_restore_sshd_restores_existing_dropin_backup() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    old_ssh_config=$SSH_CONFIG
+    old_run_sshd_dir=$RUN_SSHD_DIR
+    mkdir -p "$tmp/bin" "$tmp/sshd_config.d"
+    SSH_CONFIG="$tmp/sshd_config"
+    RUN_SSHD_DIR="$tmp/run/sshd"
+    IKE_TEST_UID=0
+    export IKE_TEST_UID
+    {
+        printf '%s\n' "Include $tmp/sshd_config.d/*.conf"
+        printf '%s\n' "PasswordAuthentication yes"
+    } > "$SSH_CONFIG.bak.20260429_090000"
+    {
+        printf '%s\n' "Include $tmp/sshd_config.d/*.conf"
+        printf '%s\n' "PasswordAuthentication no"
+    } > "$SSH_CONFIG"
+    printf '%s\n' "old dropin content" > "$tmp/sshd_config.d/00-ssh-init-hardening.conf.bak.20260429_090000"
+    write_sshd_hardening_dropin_content "$tmp/sshd_config.d/00-ssh-init-hardening.conf"
+    cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
+#!/bin/sh
+exit 0
+MOCK_SSHD
+    cat > "$tmp/bin/systemctl" <<'MOCK_SYSTEMCTL'
+#!/bin/sh
+exit 0
+MOCK_SYSTEMCTL
+    chmod +x "$tmp/bin/sshd" "$tmp/bin/systemctl"
+    PATH="$tmp/bin:$PATH"
+    backup=$(latest_sshd_backup)
+    if restore_sshd_config_from_backup "$backup" > "$tmp/out" 2>&1 &&
+        grep -q '^PasswordAuthentication yes$' "$SSH_CONFIG" &&
+        grep -q '^old dropin content$' "$tmp/sshd_config.d/00-ssh-init-hardening.conf" &&
+        grep -q "已恢复 SSH drop-in" "$tmp/out"; then
+        pass "restore sshd_config also restores existing drop-in backup"
+    else
+        fail "restore sshd_config also restores existing drop-in backup"
+    fi
+    PATH=$old_path
+    SSH_CONFIG=$old_ssh_config
+    RUN_SSHD_DIR=$old_run_sshd_dir
+    unset IKE_TEST_UID
+    rm -rf "$tmp"
+}
+
+test_restore_sshd_removes_new_managed_dropin() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    old_ssh_config=$SSH_CONFIG
+    old_run_sshd_dir=$RUN_SSHD_DIR
+    mkdir -p "$tmp/bin" "$tmp/sshd_config.d"
+    SSH_CONFIG="$tmp/sshd_config"
+    RUN_SSHD_DIR="$tmp/run/sshd"
+    IKE_TEST_UID=0
+    export IKE_TEST_UID
+    {
+        printf '%s\n' "Include $tmp/sshd_config.d/*.conf"
+        printf '%s\n' "PasswordAuthentication yes"
+    } > "$SSH_CONFIG.bak.20260429_090000"
+    {
+        printf '%s\n' "Include $tmp/sshd_config.d/*.conf"
+        printf '%s\n' "PasswordAuthentication no"
+    } > "$SSH_CONFIG"
+    write_sshd_hardening_dropin_content "$tmp/sshd_config.d/00-ssh-init-hardening.conf"
+    cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
+#!/bin/sh
+exit 0
+MOCK_SSHD
+    cat > "$tmp/bin/systemctl" <<'MOCK_SYSTEMCTL'
+#!/bin/sh
+exit 0
+MOCK_SYSTEMCTL
+    chmod +x "$tmp/bin/sshd" "$tmp/bin/systemctl"
+    PATH="$tmp/bin:$PATH"
+    backup=$(latest_sshd_backup)
+    if restore_sshd_config_from_backup "$backup" > "$tmp/out" 2>&1 &&
+        grep -q '^PasswordAuthentication yes$' "$SSH_CONFIG" &&
+        [ ! -e "$tmp/sshd_config.d/00-ssh-init-hardening.conf" ] &&
+        grep -q "已移除 ssh-init 创建的 drop-in" "$tmp/out"; then
+        pass "restore sshd_config removes newly created managed drop-in"
+    else
+        fail "restore sshd_config removes newly created managed drop-in"
+    fi
+    PATH=$old_path
+    SSH_CONFIG=$old_ssh_config
+    RUN_SSHD_DIR=$old_run_sshd_dir
+    unset IKE_TEST_UID
+    rm -rf "$tmp"
+}
+
+test_match_authentication_methods_blocks_hardening() {
+    tmp=$(make_test_dir)
+    old_ssh_config=$SSH_CONFIG
+    SSH_CONFIG="$tmp/sshd_config"
+    IKE_TEST_UID=0
+    export IKE_TEST_UID
+    {
+        printf '%s\n' "PasswordAuthentication yes"
+        printf '%s\n' "Match User admin"
+        printf '%s\n' "    AuthenticationMethods publickey,password"
+    } > "$SSH_CONFIG"
+    if (harden_ssh_config > "$tmp/out" 2>&1); then
+        fail "Match AuthenticationMethods publickey,password blocks hardening"
+    elif grep -q "AuthenticationMethods publickey,password" "$tmp/out" &&
+        grep -q "继续可能导致 SSH 无法登录" "$tmp/out" &&
+        [ "$(find "$tmp" -name 'sshd_config.bak.*' | wc -l | awk '{print $1}')" = "0" ]; then
+        pass "Match AuthenticationMethods publickey,password blocks hardening"
+    else
+        fail "Match AuthenticationMethods publickey,password blocks hardening"
+    fi
+    SSH_CONFIG=$old_ssh_config
+    unset IKE_TEST_UID
+    rm -rf "$tmp"
+}
+
+test_list_backups_includes_dropin() {
+    tmp=$(make_test_dir)
+    old_ssh_config=$SSH_CONFIG
+    SSH_CONFIG="$tmp/sshd_config"
+    mkdir -p "$tmp/sshd_config.d"
+    printf '%s\n' "Include $tmp/sshd_config.d/*.conf" > "$SSH_CONFIG"
+    printf '%s\n' "old dropin" > "$tmp/sshd_config.d/00-ssh-init-hardening.conf.bak.20260429_090000"
+    list_backups > "$tmp/out"
+    if grep -q "SSH drop-in 备份" "$tmp/out" &&
+        grep -q "00-ssh-init-hardening.conf.bak.20260429_090000" "$tmp/out"; then
+        pass "restore backup list includes drop-in backups"
+    else
+        fail "restore backup list includes drop-in backups"
+    fi
+    SSH_CONFIG=$old_ssh_config
+    rm -rf "$tmp"
+}
+
+test_fetch_github_keys_wget_busybox_timeout() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    mkdir -p "$tmp/bin"
+    cat > "$tmp/bin/wget" <<'MOCK_WGET'
+#!/bin/sh
+if [ "$1" = "--help" ]; then
+    printf '%s\n' "BusyBox wget mock"
+    exit 0
+fi
+case "$*" in
+    *-T\ 10*)
+        printf '%s\n' 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBHiTtwHOMyc2QbrXv/15/f/TmESu5rAxMdF31qhnU8g test@example'
+        exit 0
+        ;;
+esac
+exit 1
+MOCK_WGET
+    chmod +x "$tmp/bin/wget"
+    PATH="$tmp/bin:$PATH"
+    output="$tmp/keys"
+    if fetch_github_keys "ike-sh" "$output" >/dev/null 2>&1 &&
+        grep -Fq 'ssh-ed25519' "$output"; then
+        pass "fetch_github_keys uses wget -T fallback for BusyBox"
+    else
+        fail "fetch_github_keys uses wget -T fallback for BusyBox"
+    fi
+    PATH=$old_path
+    rm -rf "$tmp"
+}
+
+test_restore_both_rolls_back_sshd_when_auth_fails() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    old_ssh_config=$SSH_CONFIG
+    old_run_sshd_dir=$RUN_SSHD_DIR
+    mkdir -p "$tmp/bin"
+    setup_home "$tmp"
+    SSH_CONFIG="$tmp/sshd_config"
+    RUN_SSHD_DIR="$tmp/run/sshd"
+    IKE_TEST_UID=0
+    export IKE_TEST_UID
+    auth="$IKE_TEST_HOME/.ssh/authorized_keys"
+    mkdir -p "$IKE_TEST_HOME/.ssh"
+    printf '%s\n' "current-sshd" > "$SSH_CONFIG"
+    printf '%s\n' "restored-sshd" > "$SSH_CONFIG.bak.20260429_090000"
+    printf '%s\n' "current-auth" > "$auth"
+    cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
+#!/bin/sh
+exit 0
+MOCK_SSHD
+    cat > "$tmp/bin/systemctl" <<'MOCK_SYSTEMCTL'
+#!/bin/sh
+exit 0
+MOCK_SYSTEMCTL
+    chmod +x "$tmp/bin/sshd" "$tmp/bin/systemctl"
+    PATH="$tmp/bin:$PATH"
+    if (restore_sshd_and_authorized_keys_from_backups "$SSH_CONFIG.bak.20260429_090000" "$auth.bak.missing" > "$tmp/out" 2>&1); then
+        fail "restore both rolls back sshd when authorized_keys restore fails"
+    elif grep -q '^current-sshd$' "$SSH_CONFIG" &&
+        grep -Fxq "current-auth" "$auth" &&
+        grep -q "authorized_keys 恢复失败" "$tmp/out"; then
+        pass "restore both rolls back sshd when authorized_keys restore fails"
+    else
+        fail "restore both rolls back sshd when authorized_keys restore fails"
+    fi
+    PATH=$old_path
+    SSH_CONFIG=$old_ssh_config
+    RUN_SSHD_DIR=$old_run_sshd_dir
+    clear_test_user
+    unset IKE_TEST_UID
+    rm -rf "$tmp"
+}
+
 test_restore_latest_sshd_config_backup() {
     tmp=$(make_test_dir)
     old_path=$PATH
@@ -1595,6 +1803,25 @@ test_gen_without_ssh_keygen_fails() {
     rm -rf "$tmp"
 }
 
+test_gen_mode_public_key_mode_644() {
+    tmp=$(make_test_dir)
+    old_path=$PATH
+    mkdir -p "$tmp/bin"
+    make_mock_ssh_keygen "$tmp/bin"
+    PATH="$tmp/bin:$PATH"
+    TMP_DIR="$tmp/work"
+    mkdir -p "$TMP_DIR"
+    generate_ed25519_key_pair
+    pub_perms=$(ls -l "$GENERATED_PUBLIC_KEY_FILE" 2>/dev/null | awk '{print $1}')
+    if case "$pub_perms" in -rw-r--r--*) true;; *) false;; esac; then
+        pass "gen mode temporary public key uses mode 644"
+    else
+        fail "gen mode temporary public key uses mode 644"
+    fi
+    PATH=$old_path
+    rm -rf "$tmp"
+}
+
 test_gen_mock_ed25519() {
     tmp=$(make_test_dir)
     old_path=$PATH
@@ -1851,7 +2078,13 @@ test_authentication_methods_safe_values_allowed
 test_match_password_yes_warns_and_preserves
 test_atomic_write_failure_restores_backup
 test_effective_sshd_T_failure_restores_backup
+test_fetch_github_keys_wget_busybox_timeout
+test_restore_both_rolls_back_sshd_when_auth_fails
 test_restore_latest_sshd_config_backup
+test_restore_sshd_restores_existing_dropin_backup
+test_restore_sshd_removes_new_managed_dropin
+test_match_authentication_methods_blocks_hardening
+test_list_backups_includes_dropin
 test_restore_sshd_shows_effective_config
 test_restore_sshd_immutable_unlocks_and_relocks
 test_restore_sshd_t_failure_restores_and_relocks
@@ -1869,6 +2102,7 @@ test_keygen_generates_files_and_modes
 test_gen_mode_public_and_private_blocks
 test_gen_without_ssh_keygen_fails
 test_gen_mock_ed25519
+test_gen_mode_public_key_mode_644
 test_cli_github_parsing
 test_cli_gen_parsing
 test_cli_keys_parsing
