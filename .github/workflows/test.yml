@@ -15,8 +15,22 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
 
-      - name: Shellcheck init.sh
-        run: shellcheck -e SC2034,SC2086,SC2012 init.sh
+      - name: Shellcheck scripts
+        run: shellcheck -x -e SC2034,SC2086,SC2012 init.sh tests/*.sh tests/fixtures/*.sh
 
       - name: Run test suite
         run: sh tests/run.sh
+
+  openssh-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenSSH test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+          sudo install -d -m 0755 /run/sshd
+
+      - name: Check real OpenSSH configuration semantics
+        run: sudo sh tests/integration.sh

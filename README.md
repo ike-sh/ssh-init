@@ -17,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/ike-sh/ssh-init/main/init.sh -o ini
 如果你想固定行为、不受 `main` 更新影响，可以使用 tag 版本。生产环境更建议固定 tag；普通用户可以直接用 `main`。
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ike-sh/ssh-init/v0.5.6/init.sh -o init.sh && sh init.sh
+curl -fsSL https://raw.githubusercontent.com/ike-sh/ssh-init/v0.5.7/init.sh -o init.sh && sh init.sh
 ```
 
 运行后会看到：
@@ -47,7 +47,7 @@ GitHub 模式会从下面的公开地址拉取公钥：
 https://github.com/你的GitHub用户名.keys
 ```
 
-GitHub 上保存的是公钥，本地电脑保存的是私钥。脚本只会把有效公钥追加写入当前运行用户的 `~/.ssh/authorized_keys`，不会覆盖已有内容，重复公钥不会重复写入。
+GitHub 上保存的是公钥，本地电脑保存的是私钥。脚本只会把有效公钥追加写入当前运行用户的 `~/.ssh/authorized_keys`，不会覆盖已有内容；完全相同的公钥行（含注释）不会重复写入。旧文件末尾没有换行时，脚本会先补换行，确保新公钥独占一行。
 
 添加 GitHub 公钥的步骤：
 
@@ -116,7 +116,9 @@ sh init.sh keygen
 
 ## 服务器生成密钥
 
-菜单 `2` 会在服务器安全临时目录中生成 Ed25519 密钥对，把公钥写入当前用户的 `authorized_keys`，禁用密码登录，然后打印公钥和私钥。你必须复制保存这段私钥；脚本打印后会删除服务器临时私钥和公钥。
+菜单 `2` 会在服务器安全临时目录中生成 Ed25519 密钥对，先打印公钥和私钥。请先将私钥复制保存到本地，再输入大写 `SAVED` 确认。只有确认后，脚本才会把公钥写入当前用户的 `authorized_keys` 并禁用密码登录。
+
+取消、输入其他内容或遇到输入结束时，不会修改 `authorized_keys` 或 SSH 登录配置，临时密钥会被清理。`SSH_INIT_ASSUME_YES=1` 只能跳过最初的执行确认，不能跳过 `SAVED` 私钥保存确认。保存确认不等同于实际登录验证，操作后仍须另开窗口测试。
 
 Windows 可保存为：
 
@@ -175,7 +177,9 @@ Include /etc/ssh/sshd_config.d/*.conf
 ~/.ssh/authorized_keys.bak.YYYYmmdd_HHMMSS
 ```
 
-修改后会先执行 `sshd -t -f /etc/ssh/sshd_config` 做语法校验，再执行 `sshd -T -f /etc/ssh/sshd_config` 检查最终生效配置，确认密码登录确实关闭、公钥登录仍启用。`sshd -T` 可以发现 `Include`、`Match` 等配置导致的最终生效值偏差；如果最终生效配置不符合预期，脚本会恢复备份并停止，不会重启 SSH。
+修改后会先执行 `sshd -t -f /etc/ssh/sshd_config` 做语法校验，再执行 `sshd -T -f /etc/ssh/sshd_config` 检查全局生效配置，确认全局密码登录关闭、公钥登录仍启用。如果配置不符合预期，脚本会恢复备份并停止，不会重启 SSH。
+
+不带 `-C` 的 `sshd -T` 不能验证每个用户、来源地址对应的 `Match` 条件。脚本会递归扫描全局及 `Match` 内的 `Include`，拦截危险认证链并提示条件覆盖，但不会自动改写 `Match` 策略。复杂条件配置仍需用 `sshd -T -C user=实际用户,host=实际来源主机名,addr=实际来源IP -f /etc/ssh/sshd_config` 分别检查，并测试真实登录。
 
 如果全局配置或 `Include` 引入的配置中存在 `AuthenticationMethods publickey,password` 或包含 `keyboard-interactive` 的多因素认证要求，脚本会中止加固。因为脚本会禁用 `password`/`keyboard-interactive`，继续执行可能导致 SSH 无法登录。请先手动改为 `AuthenticationMethods publickey`，或删除该项后重试。
 
@@ -253,6 +257,8 @@ sh init.sh
 
 如果加固时写入了 `/etc/ssh/sshd_config.d/00-ssh-init-hardening.conf`，恢复 `sshd_config` 时会同步处理该 drop-in 文件：有备份则恢复备份内容；若该文件是脚本新建且没有备份，则会移除该托管 drop-in 文件，避免主配置恢复后仍被 drop-in 保持加固状态。
 
+恢复前会记录主配置、受影响 drop-in 的内容及存在状态；校验、文件操作或服务重启失败时，按这些快照回滚。“同时恢复”中的 `authorized_keys` 失败也会撤销此次 SSH 配置变更，而不是重新选择历史 drop-in 备份。回滚仍可能因磁盘或权限故障失败，此时必须通过 VNC/Console 检查。
+
 “恢复最新备份”表示恢复到脚本上次修改前的状态。`authorized_keys` 恢复不是清空文件，而是恢复备份文件内容；如果恢复后仍有公钥行，说明备份中本来就有这些公钥。
 
 恢复菜单还提供“清空当前用户 authorized_keys（危险）”选项。这个操作会先创建：
@@ -291,3 +297,15 @@ sh init.sh --debug-effective
 ```sh
 sh tests/run.sh
 ```
+
+单元测试在专用临时目录中运行，默认阻止真实网络请求和服务管理命令。回归用例覆盖末尾换行、私钥保存确认、Include/Match 扫描与跨文件恢复失败。
+
+Linux 上安装 OpenSSH server 后，还可以运行：
+
+```sh
+sh tests/integration.sh
+```
+
+该脚本使用临时主机密钥和配置，调用真实 `sshd -t` / `sshd -T -C`，不启动监听端口、不重启系统服务。部分发行版要求预先存在 `/run/sshd`。CI 单独运行这组检查；非 Linux 环境会明确跳过。它仍不能代替目标 VPS 上的新会话登录验证。
+
+最近一次 Docker 多发行版测试和内网服务器独立 SSH 实例的真实登录验证结果见 [TEST_RESULTS.md](./TEST_RESULTS.md)。`tests/remote-sandbox.sh` 仅供已准备好安全临时目录和备用 sshd 的测试驱动调用，不要用它操作生产配置或 22 端口监听进程。

@@ -20,7 +20,7 @@ SSHD_CONFIG_WAS_IMMUTABLE=0
 SSHD_CONFIG_TMP_FILE=""
 SSH_KEYGEN_WARNED=0
 SSHD_EFFECTIVE_KEYS_RE='^(pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|permitemptypasswords|permitrootlogin|authenticationmethods) '
-SSHD_SOURCE_GREP_RE='^[[:space:]]*(Include|PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|PermitEmptyPasswords|PermitRootLogin|PubkeyAuthentication|AuthenticationMethods|Match)([[:space:]]|$)'
+SSHD_SOURCE_GREP_RE='^[[:space:]]*(Include|PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|PermitEmptyPasswords|PermitRootLogin|PubkeyAuthentication|AuthenticationMethods|Match)([[:space:]=]|$)'
 
 BLUE=$(printf '\033[34m')
 GREEN=$(printf '\033[32m')
@@ -147,7 +147,12 @@ timestamp() {
 }
 
 make_tmp_dir() {
-    old_umask=$(umask)
+    # This must run in the owning shell, before make_tmp_file is captured with $().
+    if [ -n "${TMP_DIR:-}" ]; then
+        [ -d "$TMP_DIR" ] && [ ! -L "$TMP_DIR" ] && [ -w "$TMP_DIR" ]
+        return $?
+    fi
+    tmp_dir_umask=$(umask)
     umask 077
     if command -v mktemp >/dev/null 2>&1; then
         TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ssh-init.XXXXXX" 2>/dev/null || true)
@@ -155,24 +160,49 @@ make_tmp_dir() {
     if [ -z "$TMP_DIR" ]; then
         TMP_DIR="${TMPDIR:-/tmp}/ssh-init.$$"
         mkdir "$TMP_DIR" || {
-            umask "$old_umask"
-            die "无法创建临时目录: $TMP_DIR"
+            error "无法创建临时目录: $TMP_DIR"
+            TMP_DIR=""
+            umask "$tmp_dir_umask"
+            return 1
         }
     fi
-    chmod 700 "$TMP_DIR" 2>/dev/null || true
-    umask "$old_umask"
+    tmp_dir_result=0
+    chmod 700 "$TMP_DIR" 2>/dev/null || tmp_dir_result=1
+    umask "$tmp_dir_umask"
+    return "$tmp_dir_result"
 }
 
-make_tmp_file() {
-    prefix="$1"
-    if [ -z "${TMP_DIR:-}" ]; then
-        make_tmp_dir
+make_tmp_file() (
+    tmp_prefix="$1"
+    case "$tmp_prefix" in
+        ""|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-]*)
+            error "无效的临时文件前缀。"
+            return 1
+            ;;
+    esac
+    if [ -z "${TMP_DIR:-}" ] || [ ! -d "$TMP_DIR" ] || [ -L "$TMP_DIR" ]; then
+        error "临时目录未初始化或已失效，请先在父 shell 中调用 make_tmp_dir。"
+        return 1
     fi
-    file="$TMP_DIR/$prefix.$$"
-    : > "$file" || die "无法创建临时文件: $file"
-    chmod 600 "$file" 2>/dev/null || true
-    printf '%s\n' "$file"
-}
+    umask 077
+    tmp_path=""
+    if command_exists mktemp; then
+        tmp_path=$(mktemp "$TMP_DIR/$tmp_prefix.XXXXXX" 2>/dev/null || true)
+    fi
+    if [ -z "$tmp_path" ]; then
+        tmp_index=0
+        while [ "$tmp_index" -lt 1000 ]; do
+            tmp_candidate="$TMP_DIR/$tmp_prefix.$$.$tmp_index"
+            if (set -C; : > "$tmp_candidate") 2>/dev/null; then
+                tmp_path="$tmp_candidate"
+                break
+            fi
+            tmp_index=$((tmp_index + 1))
+        done
+    fi
+    [ -n "$tmp_path" ] || return 1
+    printf '%s\n' "$tmp_path"
+)
 
 safe_rm_f() {
     path="$1"
@@ -315,7 +345,7 @@ normalize_key_line() {
     [ "$key_len" -ge 20 ] || return 1
 
     if command_exists ssh-keygen; then
-        tmp_key_file=$(make_tmp_file "public-key")
+        tmp_key_file=$(make_tmp_file "public-key") || return 1
         if ! printf '%s %s\n' "$key_type" "$key_data" > "$tmp_key_file"; then
             safe_rm_f "$tmp_key_file" || true
             return 1
@@ -368,9 +398,9 @@ fetch_github_keys() {
     }
     url="https://github.com/$user.keys"
     info "正在拉取 GitHub 公钥..."
-    if command -v curl >/dev/null 2>&1; then
+    if command_exists curl; then
         curl -fsSL --connect-timeout 10 "$url" > "$output_file" || return 1
-    elif command -v wget >/dev/null 2>&1; then
+    elif command_exists wget; then
         if wget --help 2>&1 | grep -qE '(^|[[:space:]])--timeout'; then
             wget -qO- --timeout=10 "$url" > "$output_file" || return 1
         else
@@ -441,6 +471,12 @@ append_keys_to_authorized_keys() {
     while IFS= read -r key_line || [ -n "$key_line" ]; do
         [ -n "$key_line" ] || continue
         if ! grep -Fxq "$key_line" "$auth_file" 2>/dev/null; then
+            if [ "$added" -eq 0 ] && [ -s "$auth_file" ]; then
+                auth_last_byte=$(tail -c 1 "$auth_file") || die "无法检查 authorized_keys 末尾换行。"
+                if [ -n "$auth_last_byte" ]; then
+                    printf '\n' >> "$auth_file" || die "无法为 authorized_keys 补充末尾换行。"
+                fi
+            fi
             printf '%s\n' "$key_line" >> "$auth_file" || die "写入 authorized_keys 失败。"
             added=$((added + 1))
         fi
@@ -550,18 +586,18 @@ print_public_key_block() {
     public_file="$1"
     title="$2"
     [ -f "$public_file" ] || die "公钥文件不存在: $public_file"
-    print_blank
-    print_section_title "$title"
-    cat "$public_file"
+    print_blank || return 1
+    print_section_title "$title" || return 1
+    cat "$public_file" || return 1
     print_section_end
 }
 
 print_private_key_block() {
     private_file="$1"
     [ -f "$private_file" ] || die "私钥文件不存在: $private_file"
-    print_blank
-    print_section_title "请复制保存以下私钥"
-    cat "$private_file"
+    print_blank || return 1
+    print_section_title "请复制保存以下私钥" || return 1
+    cat "$private_file" || return 1
     print_section_title "私钥结束"
 }
 
@@ -714,8 +750,8 @@ github_mode() {
         error "GitHub 用户名格式无效。"
         return 1
     }
-    raw_file=$(make_tmp_file "github-keys")
-    valid_file=$(make_tmp_file "valid-keys")
+    raw_file=$(make_tmp_file "github-keys") || return 1
+    valid_file=$(make_tmp_file "valid-keys") || return 1
     fetch_rc=0
     fetch_github_keys "$github_user" "$raw_file" || fetch_rc=$?
     if [ "$fetch_rc" -eq 2 ]; then
@@ -726,7 +762,7 @@ github_mode() {
         error "拉取 GitHub 公钥失败。"
         return 1
     fi
-    count=$(filter_valid_keys "$raw_file" "$valid_file")
+    count=$(filter_valid_keys "$raw_file" "$valid_file") || return 1
     if [ "$count" -le 0 ]; then
         print_github_empty_hint "$github_user"
         return 1
@@ -760,24 +796,26 @@ generate_ed25519_key_pair() {
 
 print_generated_public_key() {
     [ -f "$GENERATED_PUBLIC_KEY_FILE" ] || die "临时公钥不存在，无法打印。"
-    print_public_key_block "$GENERATED_PUBLIC_KEY_FILE" "请复制以下公钥到 GitHub"
-    info "公钥可以放 GitHub。"
-    info "私钥必须保存到本地。"
-    info "该公钥已自动写入当前用户 authorized_keys。"
-    info "密码登录已禁用。"
+    print_public_key_block "$GENERATED_PUBLIC_KEY_FILE" "请复制以下公钥到 GitHub" || return 1
+    info "公钥可以放 GitHub。" || return 1
+    info "私钥必须保存到本地。" || return 1
+    info "确认私钥已保存后，才会写入 authorized_keys 并禁用密码登录。"
 }
 
 print_generated_private_key() {
     [ -f "$GENERATED_PRIVATE_KEY_FILE" ] || die "临时私钥不存在，无法打印。"
-    print_blank
-    print_private_key_block "$GENERATED_PRIVATE_KEY_FILE"
-    print_blank
-    info "请把私钥复制保存到本地电脑。"
-    info "Windows 可保存为 C:\\Users\\你的用户名\\.ssh\\id_ed25519_SERVER"
-    info "Linux/macOS 可保存为 ~/.ssh/id_ed25519_SERVER"
+    print_blank || return 1
+    print_private_key_block "$GENERATED_PRIVATE_KEY_FILE" || return 1
+    print_blank || return 1
+    info "请把私钥复制保存到本地电脑。" || return 1
+    info "Windows 可保存为 C:\\Users\\你的用户名\\.ssh\\id_ed25519_SERVER" || return 1
+    info "Linux/macOS 可保存为 ~/.ssh/id_ed25519_SERVER" || return 1
     info "FinalShell 导入的是私钥，不是公钥。"
-    safe_rm_f "$GENERATED_PRIVATE_KEY_FILE" || true
-    safe_rm_f "$GENERATED_PUBLIC_KEY_FILE" || true
+}
+
+remove_generated_key_pair() {
+    safe_rm_f "$GENERATED_PRIVATE_KEY_FILE" || return 1
+    safe_rm_f "$GENERATED_PUBLIC_KEY_FILE" || return 1
 }
 
 gen_mode() {
@@ -785,18 +823,29 @@ gen_mode() {
     print_section_title "在服务器生成 Ed25519 密钥"
     warn "此模式会在服务器临时生成私钥，并打印到终端。"
     warn "请只在可信服务器和可信终端使用。"
-    warn "复制保存私钥后，服务器临时私钥会被删除。"
+    warn "必须复制保存私钥并输入 SAVED 确认，才会配置密钥登录和禁用密码登录。"
+    warn "确认保存或取消后，服务器临时私钥都会被删除。"
     if [ "${SSH_INIT_ASSUME_YES:-0}" != "1" ]; then
         confirm_yes "确认生成？输入 yes 继续:" || return 1
     fi
-    valid_file=$(make_tmp_file "valid-keys")
-    generate_ed25519_key_pair
-    count=$(filter_valid_keys "$GENERATED_PUBLIC_KEY_FILE" "$valid_file")
+    generate_ed25519_key_pair || return 1
+    valid_file=$(make_tmp_file "valid-keys") || die "无法创建生成公钥的校验文件。"
+    count=$(filter_valid_keys "$GENERATED_PUBLIC_KEY_FILE" "$valid_file") || die "校验生成的公钥失败。"
     [ "$count" -gt 0 ] || die "生成的公钥格式无效。"
+    if ! print_generated_public_key || ! print_generated_private_key; then
+        remove_generated_key_pair || die "删除临时密钥失败。"
+        error "无法完整显示密钥，已取消；未写入 authorized_keys，也未修改 SSH 登录配置。"
+        return 1
+    fi
+    if ! ask_prompt "确认私钥已保存到本地？输入 SAVED 才会写入 authorized_keys 并禁用密码登录（其他输入或 EOF 取消）:" ||
+        [ "$ASK_REPLY" != "SAVED" ]; then
+        remove_generated_key_pair || die "删除临时密钥失败。"
+        warn "未确认私钥已保存，已取消；未写入 authorized_keys，也未修改 SSH 登录配置。"
+        return 1
+    fi
+    remove_generated_key_pair || die "删除临时密钥失败。"
     append_keys_to_authorized_keys "$valid_file"
     harden_ssh_config
-    print_generated_public_key
-    print_generated_private_key
     final_reminder
 }
 
@@ -854,14 +903,14 @@ effective_sshd_settings_check() {
         fi
         return 1
     fi
-    effective_file=$(make_tmp_file "sshd-effective")
+    effective_file=$(make_tmp_file "sshd-effective") || return 1
     if ! "$sshd_bin" -T -f "$config_file" > "$effective_file" 2>/dev/null; then
         if [ -n "$failures_file" ]; then
             printf '%s\n' "__SSHD_T_FAILED__" > "$failures_file" || true
         fi
         return 1
     fi
-    detected_failures=$(make_tmp_file "sshd-effective-failures")
+    detected_failures=$(make_tmp_file "sshd-effective-failures") || return 1
     awk '
         {
             key = tolower($1)
@@ -935,198 +984,243 @@ has_path_glob() {
     return 1
 }
 
-list_path_matches() {
+list_path_matches() (
+    # Disable field splitting, not pathname expansion. This also handles globs
+    # in parent directories and symlinked configuration files without eval.
     pattern="$1"
-    dir=$(ssh_init_dirname "$pattern")
-    base=${pattern##*/}
-    if has_path_glob "$base"; then
-        [ -d "$dir" ] || return 0
-        find "$dir" -maxdepth 1 -type f -name "$base" 2>/dev/null | sort
-    elif [ -f "$pattern" ]; then
-        printf '%s\n' "$pattern"
-    fi
-}
+    IFS=''
+    set +f
+    # shellcheck disable=SC2086
+    set -- $pattern
+    for matched_path do
+        [ -e "$matched_path" ] || [ -L "$matched_path" ] || continue
+        [ -f "$matched_path" ] && [ -r "$matched_path" ] || return 1
+        printf '%s\n' "$matched_path" || return 1
+    done
+)
 
 list_resolved_include_patterns() {
     pattern="$1"
-    current_dir="$2"
     case "$pattern" in
         /*)
             printf '%s\n' "$pattern"
             ;;
+        \~*)
+            # Do not silently skip a syntax whose expansion we cannot verify.
+            return 1
+            ;;
         *)
+            # OpenSSH resolves all relative Include paths against /etc/ssh,
+            # not against the directory of the including file.
             printf '%s\n' "/etc/ssh/$pattern"
-            if [ "$current_dir" != "/etc/ssh" ]; then
-                printf '%s\n' "$current_dir/$pattern"
-            fi
             ;;
     esac
 }
 
-list_include_matches() {
+list_include_matches() (
     pattern="$1"
-    current_dir="$2"
-    if [ -z "$pattern" ]; then
-        return 0
-    fi
-    resolved_file=$(make_tmp_file "sshd-resolved-includes")
-    list_resolved_include_patterns "$pattern" "$current_dir" > "$resolved_file"
-    while IFS= read -r resolved || [ -n "$resolved" ]; do
-        list_path_matches "$resolved"
-    done < "$resolved_file"
-}
+    [ -n "$pattern" ] || return 1
+    resolved=$(list_resolved_include_patterns "$pattern" "${2:-/etc/ssh}") || return 1
+    list_path_matches "$resolved"
+)
 
-config_file_include_patterns() {
-    file="$1"
-    [ -f "$file" ] || return 0
-    awk '
-        {
-            line = $0
-            sub(/\r$/, "", line)
-            sub(/^[[:space:]]*/, "", line)
-            if (line == "" || substr(line, 1, 1) == "#") next
-            sub(/[[:space:]]+#.*/, "", line)
-            n = split(line, parts, /[[:space:]]+/)
-            key = tolower(parts[1])
-            if (key == "match") {
-                in_match = 1
-                next
-            }
-            if (!in_match && key == "include") {
-                for (i = 2; i <= n; i++) {
-                    if (parts[i] != "") print parts[i]
+config_file_scan_records() (
+    scan_file="$1"
+    [ -f "$scan_file" ] && [ -r "$scan_file" ] || return 1
+    awk -v in_match="${2:-0}" '
+        # Parse quoted arguments without executing shell syntax. Records use
+        # tabs as separators, so embedded control characters are rejected.
+        function tokenize(line, parts, i, c, quote, token, started, n) {
+            for (i in parts) delete parts[i]
+            quote = ""
+            token = ""
+            started = 0
+            n = 0
+            for (i = 1; i <= length(line); i++) {
+                c = substr(line, i, 1)
+                if (c == "\\") {
+                    if (++i > length(line)) return -1
+                    token = token substr(line, i, 1)
+                    started = 1
+                } else if (quote != "") {
+                    if (c == quote) quote = ""
+                    else token = token c
+                } else if (c == "\"" || c == sprintf("%c", 39)) {
+                    quote = c
+                    started = 1
+                } else if (c == "#" && !started) {
+                    break
+                } else if (c ~ /[[:space:]]/) {
+                    if (started) parts[++n] = token
+                    token = ""
+                    started = 0
+                } else {
+                    token = token c
+                    started = 1
                 }
             }
+            if (quote != "") return -1
+            if (started) parts[++n] = token
+            return n
         }
-    ' "$file"
-}
-
-config_file_authentication_methods_risk() {
-    file="$1"
-    [ -f "$file" ] || return 0
-    awk -v file="$file" '
         {
             line = $0
             sub(/\r$/, "", line)
             sub(/^[[:space:]]*/, "", line)
-            if (line == "" || substr(line, 1, 1) == "#") next
-            sub(/[[:space:]]+#.*/, "", line)
-            n = split(line, parts, /[[:space:]]+/)
+            # OpenSSH separates the keyword from its arguments with whitespace
+            # or one optional equals sign. Equals signs inside args are data.
+            keyword_end = match(line, /[[:space:]=]/)
+            if (keyword_end > 0) {
+                keyword = substr(line, 1, keyword_end - 1)
+                arguments = substr(line, keyword_end)
+                sub(/^[[:space:]]*=[[:space:]]*/, " ", arguments)
+                line = keyword " " arguments
+            }
+            n = tokenize(line, parts)
+            if (n < 0) exit 2
+            if (n == 0) next
             key = tolower(parts[1])
             if (key == "match") {
+                if (n < 2) exit 2
                 in_match = 1
                 next
             }
-            if (key == "authenticationmethods") {
-                value = ""
+            if (key == "include") {
+                if (n < 2) exit 2
                 for (i = 2; i <= n; i++) {
-                    value = value (value == "" ? "" : " ") parts[i]
+                    if (parts[i] == "" || parts[i] ~ /[\t\r\n]/) exit 2
+                    print "include\t" in_match "\t" NR "\t" parts[i]
                 }
+                next
+            }
+            value = ""
+            for (i = 2; i <= n; i++)
+                value = value (i == 2 ? "" : " ") parts[i]
+            if (key == "authenticationmethods") {
+                if (n < 2) exit 2
                 lower = tolower(value)
                 if (lower ~ /(^|[,[:space:]])password([,[:space:]]|$)/ ||
-                    lower ~ /(^|[,[:space:]])keyboard-interactive([,:[:space:]]|$)/) {
-                    print file ":" NR ": AuthenticationMethods " value
-                    exit
-                }
+                    lower ~ /(^|[,[:space:]])keyboard-interactive([,:[:space:]]|$)/)
+                    print "authentication\t" in_match "\t" NR "\tAuthenticationMethods " value
             }
-        }
-    ' "$file"
-}
-
-config_file_match_override_risk() {
-    file="$1"
-    [ -f "$file" ] || return 0
-    awk -v file="$file" '
-        {
-            line = $0
-            sub(/\r$/, "", line)
-            sub(/^[[:space:]]*/, "", line)
-            if (line == "" || substr(line, 1, 1) == "#") next
-            sub(/[[:space:]]+#.*/, "", line)
-            n = split(line, parts, /[[:space:]]+/)
-            key = tolower(parts[1])
             value = tolower(parts[2])
-            if (key == "match") {
-                in_match = 1
-                next
-            }
             if (in_match &&
                 ((key == "passwordauthentication" && value == "yes") ||
                  (key == "kbdinteractiveauthentication" && value == "yes") ||
                  (key == "challengeresponseauthentication" && value == "yes") ||
                  (key == "pubkeyauthentication" && value == "no") ||
-                 (key == "permitrootlogin" && value == "yes"))) {
-                print file ":" NR ": " line
-                exit
-            }
+                 (key == "permitrootlogin" && value == "yes")))
+                print "match\t" in_match "\t" NR "\t" parts[1] " " parts[2]
         }
-    ' "$file"
-}
+    ' "$scan_file"
+)
+
+config_file_include_patterns() (
+    records=$(config_file_scan_records "$1" "${3:-0}") || return 1
+    printf '%s\n' "$records" | awk -F '\t' -v scope="${2:-global}" '
+        $1 == "include" && (scope == "all" || $2 == "0") { print $4 }
+    '
+)
+
+config_file_authentication_methods_risk() (
+    records=$(config_file_scan_records "$1") || return 1
+    printf '%s\n' "$records" | awk -F '\t' -v file="$1" '
+        $1 == "authentication" { print file ":" $3 ": " $4; exit }
+    '
+)
+
+config_file_match_override_risk() (
+    records=$(config_file_scan_records "$1" "${2:-0}") || return 1
+    printf '%s\n' "$records" | awk -F '\t' -v file="$1" '
+        $1 == "match" { print file ":" $3 ": " $4; exit }
+    '
+)
+
+scan_sshd_config_risk_file() (
+    # Each recursive frame owns its variables and its unique record files.
+    # A child inherits Match context, but cannot change its parent/siblings.
+    scan_file="$1"
+    scan_depth="$2"
+    scan_kind="$3"
+    scan_in_match="${4:-0}"
+    if [ "$scan_depth" -gt 16 ]; then
+        printf '%s\n' "$scan_file: Include 嵌套过深或存在循环，无法完整扫描。"
+        return 2
+    fi
+    scan_records=$(make_tmp_file "sshd-scan-records") || {
+        printf '%s\n' "$scan_file: 无法创建扫描临时文件。"
+        return 2
+    }
+    if ! config_file_scan_records "$scan_file" "$scan_in_match" > "$scan_records"; then
+        printf '%s\n' "$scan_file: 无法读取或解析 SSH 配置，已停止扫描。"
+        return 2
+    fi
+    scan_tab=$(printf '\t')
+    while IFS="$scan_tab" read -r record_kind record_match record_line record_value; do
+        if [ "$record_kind" = "$scan_kind" ]; then
+            printf '%s\n' "$scan_file:$record_line: $record_value"
+            return 1
+        fi
+        [ "$record_kind" = "include" ] || continue
+        scan_matches=$(make_tmp_file "sshd-include-matches") || {
+            printf '%s\n' "$scan_file:$record_line: 无法创建 Include 扫描临时文件。"
+            return 2
+        }
+        if ! list_include_matches "$record_value" > "$scan_matches"; then
+            printf '%s\n' "$scan_file:$record_line: 无法可靠展开 Include $record_value"
+            return 2
+        fi
+        while IFS= read -r scan_included || [ -n "$scan_included" ]; do
+            if scan_sshd_config_risk_file "$scan_included" "$((scan_depth + 1))" "$scan_kind" "$record_match"; then
+                :
+            else
+                return $?
+            fi
+        done < "$scan_matches"
+    done < "$scan_records"
+    return 0
+)
 
 scan_authentication_methods_risk_file() {
-    file="$1"
-    depth="$2"
-    [ -f "$file" ] || return 0
-
-    risk=$(config_file_authentication_methods_risk "$file" || true)
-    if [ -n "$risk" ]; then
-        AUTHENTICATION_METHODS_RISK="$risk"
-        return 1
-    fi
-    [ "$depth" -ge 3 ] && return 0
-
-    include_file=$(make_tmp_file "sshd-includes")
-    config_file_include_patterns "$file" > "$include_file" || return 0
-    current_dir=$(ssh_init_dirname "$file")
-    while IFS= read -r pattern || [ -n "$pattern" ]; do
-        matches_file=$(make_tmp_file "sshd-include-matches")
-        list_include_matches "$pattern" "$current_dir" > "$matches_file" || true
-        while IFS= read -r included || [ -n "$included" ]; do
-            [ -f "$included" ] || continue
-            scan_authentication_methods_risk_file "$included" "$((depth + 1))" || return 1
-        done < "$matches_file"
-    done < "$include_file"
-    return 0
+    scan_sshd_config_risk_file "$1" "$2" authentication "${3:-0}"
 }
 
 detect_authentication_methods_risk() {
     AUTHENTICATION_METHODS_RISK=""
-    scan_authentication_methods_risk_file "$1" 0
+    AUTHENTICATION_METHODS_SCAN_FAILED=0
+    if ! make_tmp_dir; then
+        AUTHENTICATION_METHODS_RISK="$1: 扫描临时目录不可用。"
+        AUTHENTICATION_METHODS_SCAN_FAILED=1
+        return 1
+    fi
+    if AUTHENTICATION_METHODS_RISK=$(scan_authentication_methods_risk_file "$1" 0); then
+        return 0
+    else
+        [ "$?" -eq 1 ] || AUTHENTICATION_METHODS_SCAN_FAILED=1
+        return 1
+    fi
 }
 
 scan_match_override_risk_file() {
-    file="$1"
-    depth="$2"
-    [ -f "$file" ] || return 0
-    [ "$MATCH_OVERRIDE_RISK_FOUND" = "1" ] && return 0
-
-    risk=$(config_file_match_override_risk "$file" || true)
-    if [ -n "$risk" ]; then
-        MATCH_OVERRIDE_RISK="$risk"
-        MATCH_OVERRIDE_RISK_FOUND=1
-        return 0
-    fi
-    [ "$depth" -ge 3 ] && return 0
-
-    include_file=$(make_tmp_file "sshd-includes")
-    config_file_include_patterns "$file" > "$include_file" || return 0
-    current_dir=$(ssh_init_dirname "$file")
-    while IFS= read -r pattern || [ -n "$pattern" ]; do
-        matches_file=$(make_tmp_file "sshd-include-matches")
-        list_include_matches "$pattern" "$current_dir" > "$matches_file" || true
-        while IFS= read -r included || [ -n "$included" ]; do
-            [ -f "$included" ] || continue
-            scan_match_override_risk_file "$included" "$((depth + 1))"
-            [ "$MATCH_OVERRIDE_RISK_FOUND" = "1" ] && return 0
-        done < "$matches_file"
-    done < "$include_file"
+    scan_sshd_config_risk_file "$1" "$2" match "${3:-0}"
 }
 
 detect_match_override_risk() {
     MATCH_OVERRIDE_RISK=""
     MATCH_OVERRIDE_RISK_FOUND=0
-    scan_match_override_risk_file "$1" 0
-    [ "$MATCH_OVERRIDE_RISK_FOUND" = "1" ]
+    MATCH_OVERRIDE_SCAN_FAILED=0
+    if ! make_tmp_dir; then
+        MATCH_OVERRIDE_RISK="$1: 扫描临时目录不可用。"
+        MATCH_OVERRIDE_SCAN_FAILED=1
+        return 0
+    fi
+    if MATCH_OVERRIDE_RISK=$(scan_match_override_risk_file "$1" 0); then
+        return 1
+    else
+        [ "$?" -eq 1 ] || MATCH_OVERRIDE_SCAN_FAILED=1
+        MATCH_OVERRIDE_RISK_FOUND=1
+        return 0
+    fi
 }
 
 make_sshd_config_tmp_file() {
@@ -1161,11 +1255,11 @@ sshd_dropin_dir_from_config() {
     file="$1"
     [ -f "$file" ] || return 1
     current_dir=$(ssh_init_dirname "$file")
-    patterns_file=$(make_tmp_file "sshd-dropin-patterns")
+    patterns_file=$(make_tmp_file "sshd-dropin-patterns") || return 1
     config_file_include_patterns "$file" > "$patterns_file" || return 1
     while IFS= read -r pattern || [ -n "$pattern" ]; do
-        resolved_file=$(make_tmp_file "sshd-dropin-resolved")
-        list_resolved_include_patterns "$pattern" "$current_dir" > "$resolved_file"
+        resolved_file=$(make_tmp_file "sshd-dropin-resolved") || return 1
+        list_resolved_include_patterns "$pattern" "$current_dir" > "$resolved_file" || return 1
         while IFS= read -r resolved || [ -n "$resolved" ]; do
             dir=$(ssh_init_dirname "$resolved")
             base=${resolved##*/}
@@ -1277,7 +1371,7 @@ write_hardened_sshd_config() {
             if (substr(tmp, 1, 1) == "#") {
                 sub(/^#[[:space:]]*/, "", tmp)
             }
-            split(tmp, parts, /[[:space:]]+/)
+            split(tmp, parts, /[[:space:]=]+/)
             return tolower(parts[1])
         }
 
@@ -1285,7 +1379,7 @@ write_hardened_sshd_config() {
             tmp = line
             sub(/^[[:space:]]*/, "", tmp)
             if (substr(tmp, 1, 1) == "#") return 0
-            split(tmp, parts, /[[:space:]]+/)
+            split(tmp, parts, /[[:space:]=]+/)
             return tolower(parts[1]) == "match"
         }
 
@@ -1386,6 +1480,10 @@ harden_ssh_config() {
     require_root
     [ -f "$SSH_CONFIG" ] || die "找不到 SSH 配置文件: $SSH_CONFIG"
     if ! detect_authentication_methods_risk "$SSH_CONFIG"; then
+        if [ "${AUTHENTICATION_METHODS_SCAN_FAILED:-0}" = "1" ]; then
+            error "无法完整检查 SSH 认证配置，未进行加固。"
+            die "$AUTHENTICATION_METHODS_RISK"
+        fi
         auth_methods=$(printf '%s\n' "$AUTHENTICATION_METHODS_RISK" | sed 's/^.*: AuthenticationMethods //')
         error "当前 SSH 配置要求多因素认证 AuthenticationMethods $auth_methods 或 keyboard-interactive。"
         error "脚本会禁用 password / keyboard-interactive，继续可能导致 SSH 无法登录。"
@@ -1394,6 +1492,10 @@ harden_ssh_config() {
     fi
     match_override_warned=0
     if detect_match_override_risk "$SSH_CONFIG"; then
+        if [ "${MATCH_OVERRIDE_SCAN_FAILED:-0}" = "1" ]; then
+            error "无法完整检查 Match 条件配置，未进行加固。"
+            die "$MATCH_OVERRIDE_RISK"
+        fi
         match_override_warned=1
         warn_match_override_risk
     fi
@@ -1466,7 +1568,10 @@ harden_ssh_config() {
         die "sshd -t 校验失败，已恢复备份。"
     fi
     success "SSH 配置校验通过"
-    effective_failures=$(make_tmp_file "sshd-effective-check")
+    if ! effective_failures=$(make_tmp_file "sshd-effective-check"); then
+        rollback_sshd_hardening "$backup" "$dropin_file" "$dropin_backup" "$dropin_existed" || true
+        die "无法创建生效配置检查文件，已尝试恢复 SSH 配置。"
+    fi
     if ! effective_sshd_settings_check "$SSH_CONFIG" "$effective_failures"; then
         print_effective_sshd_settings_failure "$effective_failures"
         rollback_sshd_hardening "$backup" "$dropin_file" "$dropin_backup" "$dropin_existed" || true
@@ -1532,22 +1637,81 @@ is_managed_ssh_init_dropin() {
     grep -Fq 'Managed by ssh-init' "$file" 2>/dev/null
 }
 
-restore_sshd_dropin_from_backup_or_remove() {
-    dropin_file=$(sshd_hardening_dropin_path "$SSH_CONFIG" 2>/dev/null || true)
-    [ -n "$dropin_file" ] || return 0
+restore_sshd_dropin_from_backup_or_remove() (
+    # Resolve both arguments before changing sshd_config. Never choose a new
+    # backup while rolling back a partially completed restore.
+    restore_dropin_file="$1"
+    restore_dropin_backup="$2"
+    [ -n "$restore_dropin_file" ] || return 0
 
-    dropin_backup=$(latest_dropin_backup 2>/dev/null || true)
-    if [ -n "$dropin_backup" ] && [ -f "$dropin_backup" ]; then
-        cp -p "$dropin_backup" "$dropin_file" || return 1
-        success "已恢复 SSH drop-in: $dropin_file"
+    if [ -n "$restore_dropin_backup" ]; then
+        cp -p "$restore_dropin_backup" "$restore_dropin_file" || return 1
+        success "已恢复 SSH drop-in: $restore_dropin_file"
         return 0
     fi
 
-    if is_managed_ssh_init_dropin "$dropin_file"; then
-        safe_rm_f "$dropin_file" || return 1
-        success "已移除 ssh-init 创建的 drop-in: $dropin_file"
+    if is_managed_ssh_init_dropin "$restore_dropin_file"; then
+        safe_rm_f "$restore_dropin_file" || return 1
+        success "已移除 ssh-init 创建的 drop-in: $restore_dropin_file"
     fi
     return 0
+)
+
+snapshot_restore_file() (
+    [ -n "$1" ] || { printf '%s\n' 0; return 0; }
+    if [ -L "$1" ] || { [ -e "$1" ] && [ ! -f "$1" ]; }; then
+        error "恢复目标不是普通文件或是 symlink: $1"
+        return 1
+    fi
+    if [ -f "$1" ]; then
+        # Do not overwrite an earlier recovery snapshot from the same second.
+        (set -C; : > "$2") || return 1
+        cp -p "$1" "$2" || return 1
+        printf '%s\n' 1
+    else
+        printf '%s\n' 0
+    fi
+)
+
+restore_file_snapshot() (
+    [ -n "$1" ] || return 0
+    if [ "$3" = "1" ]; then
+        cp -p "$2" "$1"
+    else
+        safe_rm_f "$1"
+    fi
+)
+
+rollback_sshd_restore_transaction() {
+    # These names belong only to restore_sshd_transaction's subshell.
+    restore_tx_rollback_failed=0
+    restore_file_snapshot "$SSH_CONFIG" "$restore_tx_main_before" "$restore_tx_main_existed" || restore_tx_rollback_failed=1
+    restore_file_snapshot "$restore_tx_dropin" "$restore_tx_dropin_before" "$restore_tx_dropin_existed" || restore_tx_rollback_failed=1
+    restore_file_snapshot "$restore_tx_other_dropin" "$restore_tx_other_before" "$restore_tx_other_existed" || restore_tx_rollback_failed=1
+    if [ "$restore_tx_with_auth" = "1" ]; then
+        restore_file_snapshot "$restore_tx_auth" "$restore_tx_auth_before" "$restore_tx_auth_existed" || restore_tx_rollback_failed=1
+    fi
+    if [ "$restore_tx_service_touched" = "1" ]; then
+        if ! validate_sshd_config || ! restart_ssh_service; then
+            warn "操作前的 SSH 配置未能重新加载，请通过 VNC/Console 检查。"
+            restore_tx_rollback_failed=1
+        fi
+    fi
+    relock_immutable_if_needed "$SSH_CONFIG"
+    [ "$restore_tx_rollback_failed" = "0" ]
+}
+
+cleanup_sshd_restore_transaction() {
+    if [ "$restore_tx_active" = "1" ]; then
+        if rollback_sshd_restore_transaction; then
+            warn "已还原操作前的 sshd_config、SSH drop-in 和相关 authorized_keys 状态。"
+        else
+            warn "恢复操作的回滚未完全成功；请保留 before-restore 备份并通过 VNC/Console 检查。"
+        fi
+    fi
+    if [ -n "$restore_tx_staged" ]; then
+        safe_rm_f "$restore_tx_staged" || true
+    fi
 }
 
 list_matching_files_reverse() {
@@ -1622,7 +1786,7 @@ debug_effective_config() {
 
     printf '%s\n' "[最终生效关键项]"
     if [ -n "$sshd_bin" ]; then
-        effective_file=$(make_tmp_file "sshd-debug-effective")
+        effective_file=$(make_tmp_file "sshd-debug-effective") || return 1
         if "$sshd_bin" -T -f "$SSH_CONFIG" > "$effective_file" 2>/dev/null; then
             if ! grep -Ei "$SSHD_EFFECTIVE_KEYS_RE" "$effective_file"; then
                 printf '%s\n' "(未输出相关关键项)"
@@ -1660,43 +1824,85 @@ show_authorized_keys_summary() {
     fi
 }
 
-restore_sshd_config_from_backup() {
-    backup="$1"
-    [ -f "$backup" ] || {
+restore_sshd_transaction() (
+    # POSIX sh functions otherwise share variables with their callers. Keep
+    # transaction paths and the immutable flag isolated from helper functions.
+    restore_tx_backup="$1"
+    restore_tx_with_auth="$2"
+    restore_tx_auth_backup="${3:-}"
+    restore_tx_active=0
+    restore_tx_service_touched=0
+    restore_tx_staged=""
+    [ -f "$restore_tx_backup" ] || {
         error "没有找到 sshd_config 备份。"
         return 1
     }
     require_root
+    trap cleanup_sshd_restore_transaction EXIT
+    trap 'exit 1' HUP INT TERM
+
+    # Stage before mutation and resolve paths from both configuration versions.
+    # OpenSSH itself resolves relative Includes against /etc/ssh.
+    restore_tx_staged=$(make_sshd_config_tmp_file "$SSH_CONFIG") || return 1
+    [ -n "$restore_tx_staged" ] || return 1
+    cp -p "$restore_tx_backup" "$restore_tx_staged" || return 1
+    restore_tx_other_dropin=$(sshd_hardening_dropin_path "$SSH_CONFIG" 2>/dev/null || true)
+    restore_tx_dropin=$(sshd_hardening_dropin_path "$restore_tx_staged" 2>/dev/null || true)
+    if [ "$restore_tx_other_dropin" = "$restore_tx_dropin" ]; then
+        restore_tx_other_dropin=""
+    fi
+    restore_tx_dropin_backup=""
+    if [ -n "$restore_tx_dropin" ]; then
+        restore_tx_dropin_backup=$(latest_matching_file "$restore_tx_dropin.bak.*" 2>/dev/null || true)
+    fi
+
+    restore_tx_stamp="$(timestamp).$$"
+    restore_tx_sequence=0
+    while [ -e "$SSH_CONFIG.before-restore.$restore_tx_stamp" ] ||
+        [ -L "$SSH_CONFIG.before-restore.$restore_tx_stamp" ]; do
+        restore_tx_sequence=$((restore_tx_sequence + 1))
+        restore_tx_stamp="$(timestamp).$$.$restore_tx_sequence"
+    done
+    restore_tx_main_before="$SSH_CONFIG.before-restore.$restore_tx_stamp"
+    restore_tx_dropin_before="$restore_tx_dropin.before-restore.$restore_tx_stamp"
+    restore_tx_other_before="$restore_tx_other_dropin.before-restore.$restore_tx_stamp"
+    restore_tx_main_existed=$(snapshot_restore_file "$SSH_CONFIG" "$restore_tx_main_before") || return 1
+    restore_tx_dropin_existed=$(snapshot_restore_file "$restore_tx_dropin" "$restore_tx_dropin_before") || return 1
+    restore_tx_other_existed=$(snapshot_restore_file "$restore_tx_other_dropin" "$restore_tx_other_before") || return 1
+    restore_tx_auth=""
+    restore_tx_auth_before=""
+    restore_tx_auth_existed=0
+    if [ "$restore_tx_with_auth" = "1" ]; then
+        restore_tx_auth=$(current_auth_file)
+        restore_tx_auth_before="$restore_tx_auth.before-restore.$restore_tx_stamp"
+        restore_tx_auth_existed=$(snapshot_restore_file "$restore_tx_auth" "$restore_tx_auth_before") || return 1
+    fi
+
     unlock_immutable_if_needed "$SSH_CONFIG"
-    before="$SSH_CONFIG.before-restore.$(timestamp)"
-    if ! cp -p "$SSH_CONFIG" "$before"; then
-        relock_immutable_if_needed "$SSH_CONFIG"
+    restore_tx_active=1
+    if ! cp -p "$restore_tx_staged" "$SSH_CONFIG"; then
+        error "恢复 sshd_config 失败，正在还原操作前状态。"
         return 1
     fi
-    if ! cp -p "$backup" "$SSH_CONFIG"; then
-        cp -p "$before" "$SSH_CONFIG" || true
-        relock_immutable_if_needed "$SSH_CONFIG"
-        return 1
-    fi
-    if ! restore_sshd_dropin_from_backup_or_remove; then
-        cp -p "$before" "$SSH_CONFIG" || true
-        relock_immutable_if_needed "$SSH_CONFIG"
-        error "恢复 SSH drop-in 失败，已还原当前配置。"
+    if ! restore_sshd_dropin_from_backup_or_remove "$restore_tx_dropin" "$restore_tx_dropin_backup"; then
+        error "恢复 SSH drop-in 失败，正在还原操作前状态。"
         return 1
     fi
     if ! validate_sshd_config; then
-        cp -p "$before" "$SSH_CONFIG" || true
-        relock_immutable_if_needed "$SSH_CONFIG"
-        error "恢复后的 sshd_config 未通过 sshd -t，已还原当前配置。"
+        error "恢复后的 sshd_config 未通过 sshd -t，正在还原操作前状态。"
         return 1
     fi
+    if [ "$restore_tx_with_auth" = "1" ] &&
+        ! (restore_authorized_keys_from_backup "$restore_tx_auth_backup"); then
+        error "authorized_keys 恢复失败，正在还原操作前状态。"
+        return 1
+    fi
+    restore_tx_service_touched=1
     if ! restart_ssh_service; then
-        cp -p "$before" "$SSH_CONFIG" || true
-        restart_ssh_service >/dev/null 2>&1 || true
-        relock_immutable_if_needed "$SSH_CONFIG"
-        error "SSH 服务重启失败，已还原当前配置。"
+        error "SSH 服务重启失败，正在还原操作前状态。"
         return 1
     fi
+    restore_tx_active=0
     relock_immutable_if_needed "$SSH_CONFIG"
     success "sshd_config 已恢复。"
     success "SSH 服务已重启。"
@@ -1706,41 +1912,15 @@ restore_sshd_config_from_backup() {
     [ -n "$password_auth" ] && info "当前 PasswordAuthentication: $password_auth"
     [ -n "$permit_root" ] && info "当前 PermitRootLogin: $permit_root"
     return 0
+)
+
+restore_sshd_config_from_backup() {
+    restore_sshd_transaction "$1" 0
 }
 
 restore_sshd_and_authorized_keys_from_backups() {
-    ssh_backup="$1"
-    auth_backup="$2"
-    auth_file=$(current_auth_file)
-    ssh_before=""
-    auth_before=""
-    stamp=$(timestamp)
-
-    if [ -f "$SSH_CONFIG" ]; then
-        ssh_before="$SSH_CONFIG.before-both-restore.$stamp"
-        cp -p "$SSH_CONFIG" "$ssh_before" || return 1
-    fi
-    if [ -f "$auth_file" ]; then
-        auth_before="$auth_file.before-both-restore.$stamp"
-        cp -p "$auth_file" "$auth_before" || return 1
-    fi
-
-    if ! restore_sshd_config_from_backup "$ssh_backup"; then
-        return 1
-    fi
-    if restore_authorized_keys_from_backup "$auth_backup"; then
-        info "请新开终端测试 SSH 登录是否恢复正常。"
-        return 0
-    fi
-
-    warn "authorized_keys 恢复失败，正在回滚 sshd_config..."
-    if [ -n "$ssh_before" ] && [ -f "$ssh_before" ]; then
-        restore_sshd_config_from_backup "$ssh_before" || warn "sshd_config 回滚失败，请手动检查。"
-    fi
-    if [ -n "$auth_before" ] && [ -f "$auth_before" ]; then
-        cp -p "$auth_before" "$auth_file" || warn "authorized_keys 回滚失败，请手动检查。"
-    fi
-    return 1
+    restore_sshd_transaction "$1" 1 "$2" || return 1
+    info "请新开终端测试 SSH 登录是否恢复正常。"
 }
 
 restore_authorized_keys_from_backup() {
@@ -2048,6 +2228,11 @@ main() {
         usage
         exit 1
     }
+    # Temporary-file helpers run in command substitutions. Keep ownership of
+    # their directory in this shell so the exit trap can always remove it.
+    if [ "$CLI_MODE" != "help" ]; then
+        make_tmp_dir || die "无法初始化安全临时目录。"
+    fi
     if [ "$CLI_MODE" = "menu" ]; then
         interactive_main
         return 0

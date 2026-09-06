@@ -7,6 +7,41 @@ IKE_TEST_MODE=1
 export IKE_TEST_MODE
 . "$ROOT_DIR/init.sh"
 
+# Every test artifact and default command lives below a fresh, canonical root.
+# Per-test mocks take precedence; an unmocked service/network call fails closed.
+TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/ssh-init-tests.XXXXXX")
+TEST_ROOT=$(CDPATH=; cd "$TEST_ROOT" && pwd -P)
+TMPDIR=$TEST_ROOT
+SSH_CONFIG="$TEST_ROOT/sshd_config"
+RUN_SSHD_DIR="$TEST_ROOT/run/sshd"
+export TMPDIR SSH_CONFIG RUN_SSHD_DIR
+mkdir "$TEST_ROOT/bin"
+for test_command in curl wget sshd systemctl service rc-service chattr lsattr; do
+    cp "$ROOT_DIR/tests/fixtures/blocked-command.sh" "$TEST_ROOT/bin/$test_command"
+    chmod +x "$TEST_ROOT/bin/$test_command"
+done
+PATH="$TEST_ROOT/bin:$PATH"
+export PATH
+make_tmp_dir
+
+cleanup_tests() {
+    cleanup_tmp
+    case "$TEST_ROOT" in
+        /*/ssh-init-tests.*)
+            if [ -d "$TEST_ROOT" ] && [ ! -L "$TEST_ROOT" ]; then
+                test_resolved_root=$(CDPATH=; cd "$TEST_ROOT" && pwd -P)
+                if [ "$test_resolved_root" = "$TEST_ROOT" ]; then
+                    rm -rf "$TEST_ROOT"
+                fi
+            fi
+            ;;
+    esac
+}
+trap cleanup_tests EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 PASS_COUNT=0
 FAIL_COUNT=0
 VALID_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBHiTtwHOMyc2QbrXv/15/f/TmESu5rAxMdF31qhnU8g test@example"
@@ -1292,6 +1327,7 @@ if [ "$1" = "--help" ]; then
     printf '%s\n' "BusyBox wget mock"
     exit 0
 fi
+printf '%s\n' "$*" >> "$WGET_LOG"
 case "$*" in
     *-T\ 10*)
         printf '%s\n' 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBHiTtwHOMyc2QbrXv/15/f/TmESu5rAxMdF31qhnU8g test@example'
@@ -1303,12 +1339,21 @@ MOCK_WGET
     chmod +x "$tmp/bin/wget"
     PATH="$tmp/bin:$PATH"
     output="$tmp/keys"
-    if fetch_github_keys "ike-sh" "$output" >/dev/null 2>&1 &&
-        grep -Fq 'ssh-ed25519' "$output"; then
+    WGET_LOG="$tmp/wget.log"
+    export WGET_LOG
+    if (
+        command_exists() {
+            [ "$1" != "curl" ] && command -v "$1" >/dev/null 2>&1
+        }
+        fetch_github_keys "ike-sh" "$output"
+    ) >/dev/null 2>&1 &&
+        grep -Fq 'ssh-ed25519' "$output" &&
+        grep -Fxq -- '-qO- -T 10 https://github.com/ike-sh.keys' "$WGET_LOG"; then
         pass "fetch_github_keys uses wget -T fallback for BusyBox"
     else
         fail "fetch_github_keys uses wget -T fallback for BusyBox"
     fi
+    unset WGET_LOG
     PATH=$old_path
     rm -rf "$tmp"
 }
@@ -1782,10 +1827,13 @@ test_gen_mode_public_and_private_blocks() {
     } > "$tmp/out" 2>&1
     if grep -q "请复制以下公钥到 GitHub" "$tmp/out" &&
         grep -q "请复制保存以下私钥" "$tmp/out" &&
-        grep -q "该公钥已自动写入当前用户 authorized_keys" "$tmp/out"; then
-        pass "gen mode output includes public and private blocks"
+        grep -q "确认私钥已保存后，才会写入 authorized_keys" "$tmp/out" &&
+        ! grep -q "密码登录已禁用" "$tmp/out" &&
+        [ -f "$GENERATED_PRIVATE_KEY_FILE" ] &&
+        [ -f "$GENERATED_PUBLIC_KEY_FILE" ]; then
+        pass "gen mode output includes key blocks without claiming authentication changes"
     else
-        fail "gen mode output includes public and private blocks"
+        fail "gen mode output includes key blocks without claiming authentication changes"
     fi
     rm -rf "$tmp"
 }
@@ -1806,6 +1854,7 @@ test_gen_without_ssh_keygen_fails() {
 test_gen_mode_public_key_mode_644() {
     tmp=$(make_test_dir)
     old_path=$PATH
+    old_gen_tmp_dir=$TMP_DIR
     mkdir -p "$tmp/bin"
     make_mock_ssh_keygen "$tmp/bin"
     PATH="$tmp/bin:$PATH"
@@ -1819,12 +1868,14 @@ test_gen_mode_public_key_mode_644() {
         fail "gen mode temporary public key uses mode 644"
     fi
     PATH=$old_path
+    TMP_DIR=$old_gen_tmp_dir
     rm -rf "$tmp"
 }
 
 test_gen_mock_ed25519() {
     tmp=$(make_test_dir)
     old_path=$PATH
+    old_gen_tmp_dir=$TMP_DIR
     mkdir -p "$tmp/bin"
     cat > "$tmp/bin/ssh-keygen" <<'MOCK_KEYGEN'
 #!/bin/sh
@@ -1851,6 +1902,7 @@ MOCK_KEYGEN
         fail "gen mode mock generates ed25519"
     fi
     PATH=$old_path
+    TMP_DIR=$old_gen_tmp_dir
     rm -rf "$tmp"
 }
 
@@ -2116,6 +2168,10 @@ test_status_output
 test_debug_effective_outputs_report_without_config_d
 test_restore_authorized_keys_message
 test_no_forbidden_features
+
+. "$ROOT_DIR/tests/keys-regression.sh"
+. "$ROOT_DIR/tests/scanner-regression.sh"
+. "$ROOT_DIR/tests/restore-regression.sh"
 
 if [ "$FAIL_COUNT" -gt 0 ]; then
     printf '%s\n' "$FAIL_COUNT test(s) failed" >&2
