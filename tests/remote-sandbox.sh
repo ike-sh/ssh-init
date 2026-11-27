@@ -14,7 +14,7 @@ e2e_fail() {
 E2E_ROOT=$1
 E2E_ACTION=$2
 case "$E2E_ACTION" in
-    append|harden|restore|invalid-restore|gen) ;;
+    append|restore-append|harden|restore|invalid-restore|gen) ;;
     *) e2e_fail 'unsupported action' ;;
 esac
 case "$E2E_ROOT" in
@@ -36,9 +36,13 @@ E2E_RESOLVED=$(CDPATH=; cd "$E2E_ROOT" && pwd -P)
 [ -f "$E2E_ROOT/init.sh" ] || e2e_fail 'sandbox init.sh is missing'
 [ -f "$E2E_ROOT/sshd_config" ] || e2e_fail 'sandbox sshd_config is missing'
 [ -d "$E2E_ROOT/home" ] || e2e_fail 'sandbox home is missing'
+[ "$(stat -c %u "$E2E_ROOT")" = 0 ] || e2e_fail 'sandbox root must belong to root'
+case "$(stat -c %a "$E2E_ROOT")" in *[2367][0-7]|*[0-7][2367]) e2e_fail 'sandbox root is writable by others' ;; esac
 readonly E2E_ROOT E2E_ACTION
+unset TX_LOCAL_STATE
 
 SSH_CONFIG="$E2E_ROOT/sshd_config"
+[ ! -e "$SSH_CONFIG.ssh-init.d/pending" ] || e2e_fail 'previous transaction incomplete; inspect fixture before reuse'
 RUN_SSHD_DIR="$E2E_ROOT/run/sshd"
 IKE_TEST_HOME="$E2E_ROOT/home"
 IKE_TEST_USER=root
@@ -56,6 +60,14 @@ require_root
 make_tmp_dir || e2e_fail 'cannot initialize private temporary directory'
 E2E_TMP_DIR=$TMP_DIR
 readonly E2E_TMP_DIR
+# Tripwires in addition to the three API overrides: a new code path must
+# never fall through to the host's manager, even during recovery.
+mkdir "$E2E_TMP_DIR/bin"
+for cmd in systemctl service rc-service; do
+    printf '%s\n' '#!/bin/sh' 'echo "remote-sandbox: system service access denied" >&2; exit 125' > "$E2E_TMP_DIR/bin/$cmd"
+    chmod 700 "$E2E_TMP_DIR/bin/$cmd"
+done
+PATH="$E2E_TMP_DIR/bin:$PATH"; export PATH
 
 e2e_cleanup() {
     # Never remove the fixture root or any directory belonging to another run.
@@ -71,9 +83,11 @@ e2e_cleanup() {
         ''|"$E2E_ROOT"/.*.ssh-init.*) ;;
         *) SSHD_CONFIG_TMP_FILE='' ;;
     esac
-    cleanup_tmp
+    # Use production signal/rollback handling after checking fixture ownership.
+    # A service rollback still goes exclusively through the listener token.
+    ssh_init_exit "$1"
 }
-trap e2e_cleanup EXIT
+trap 'e2e_cleanup $?' EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -116,7 +130,7 @@ EOF
 
 e2e_check_effective_paths() {
     E2E_SSHD_BIN=$(find_sshd_bin) || e2e_fail 'sshd is unavailable'
-    "$E2E_SSHD_BIN" -T -f "$SSH_CONFIG" > "$E2E_TMP_DIR/effective" ||
+    "$E2E_SSHD_BIN" -T -f "$SSH_CONFIG" "$@" > "$E2E_TMP_DIR/effective" ||
         e2e_fail 'cannot read effective sandbox configuration'
     awk -v root="$E2E_ROOT/" '
         function inside(value) {
@@ -160,12 +174,20 @@ e2e_verify_listener_pid() {
         '
 }
 
-# This override is mandatory: init.sh otherwise restarts the real SSH service.
+# Preserve the identity of the independently launched listener across apply and
+# rollback. Never discover or restart a service using a system manager.
+ssh_service_snapshot() {
+    e2e_verify_listener_pid || return 1
+    printf 'listener:%s\n' "$E2E_RELOAD_PID"
+}
+ssh_service_restore() { restart_ssh_service "$@"; }
 restart_ssh_service() {
+    [ "$#" = 1 ] || return 1
     e2e_check_config_tree "$SSH_CONFIG" || return 1
     e2e_check_effective_paths || return 1
+    e2e_check_effective_paths -C 'user=root,addr=127.0.0.1,host=localhost' || return 1
     validate_sshd_config || return 1
-    e2e_verify_listener_pid || return 1
+    e2e_verify_listener_pid && [ "$1" = "listener:$E2E_RELOAD_PID" ] || return 1
     [ -f "$E2E_ROOT/sshd.log" ] && [ ! -L "$E2E_ROOT/sshd.log" ] || return 1
     E2E_RELOAD_BEFORE=$(grep -c 'Server listening on ' "$E2E_ROOT/sshd.log" || true)
     kill -HUP "$E2E_RELOAD_PID" || return 1
@@ -184,25 +206,51 @@ restart_ssh_service() {
 
 e2e_check_config_tree "$SSH_CONFIG"
 e2e_check_effective_paths
+e2e_check_effective_paths -C 'user=root,addr=127.0.0.1,host=localhost'
+
+# Undo the independent append case before testing an actual new key import
+# via harden. A combined restore must not mix two independent latest backups.
+e2e_key_b() {
+    [ -f "$E2E_ROOT/key-b.pub" ] || e2e_fail 'key-b.pub is missing'
+    E2E_VALID_KEYS="$E2E_TMP_DIR/key-b.valid"
+    E2E_KEY_COUNT=$(filter_valid_keys "$E2E_ROOT/key-b.pub" "$E2E_VALID_KEYS") || e2e_fail 'cannot validate key-b.pub'
+    [ "$E2E_KEY_COUNT" -eq 1 ] || e2e_fail 'expected exactly one public key'
+}
+e2e_append_locked() {
+    prepare_authorized_keys && tx_begin '' '' "$AUTHORIZED_KEYS_FILE" &&
+        tx_touch sshdir && tx_touch auth && append_keys_to_authorized_keys "$E2E_VALID_KEYS"
+}
+e2e_restore_locked() {
+    E2E_BATCH=$(find_restore_batch both) || e2e_fail 'combined sandbox batch is missing'
+    e2e_require_inside "$E2E_BATCH"
+    [ "$(cat "$E2E_BATCH/main.path")" = "$SSH_CONFIG" ] || e2e_fail 'unexpected saved config path'
+    [ "$(cat "$E2E_BATCH/auth.path")" = "$IKE_TEST_HOME/.ssh/authorized_keys" ] || e2e_fail 'unexpected saved auth path'
+    if [ -f "$E2E_BATCH/drop.path" ]; then
+        [ "$(cat "$E2E_BATCH/drop.path")" = "$E2E_ROOT/sshd_config.d/00-ssh-init-hardening.conf" ] || e2e_fail 'unexpected saved drop-in path'
+        if [ -f "$E2E_BATCH/drop.data" ]; then e2e_check_config_tree "$E2E_BATCH/drop.data"; fi
+    fi
+    e2e_check_config_tree "$E2E_BATCH/main.data"
+    restore_batch_locked both "$E2E_BATCH" "$E2E_BATCH"
+}
 
 case "$E2E_ACTION" in
     append)
-        [ -f "$E2E_ROOT/key-b.pub" ] || e2e_fail 'key-b.pub is missing'
-        E2E_VALID_KEYS="$E2E_TMP_DIR/key-b.valid"
-        E2E_KEY_COUNT=$(filter_valid_keys "$E2E_ROOT/key-b.pub" "$E2E_VALID_KEYS") ||
-            e2e_fail 'cannot validate key-b.pub'
-        [ "$E2E_KEY_COUNT" -eq 1 ] || e2e_fail 'expected exactly one public key'
-        append_keys_to_authorized_keys "$E2E_VALID_KEYS"
+        e2e_key_b
+        with_write_lock e2e_append_locked
+        ;;
+    restore-append)
+        restore_latest_backup auth
         ;;
     harden)
-        harden_ssh_config
+        if [ -f "$E2E_ROOT/key-b.pub" ]; then
+            e2e_key_b
+            harden_ssh_config "$E2E_VALID_KEYS"
+        else
+            harden_ssh_config
+        fi
         ;;
     restore)
-        E2E_CONFIG_BACKUP=$(latest_sshd_backup) || e2e_fail 'configuration backup is missing'
-        E2E_AUTH_BACKUP=$(latest_authorized_keys_backup) || e2e_fail 'authorized_keys backup is missing'
-        e2e_require_inside "$E2E_AUTH_BACKUP"
-        e2e_check_config_tree "$E2E_CONFIG_BACKUP"
-        restore_sshd_and_authorized_keys_from_backups "$E2E_CONFIG_BACKUP" "$E2E_AUTH_BACKUP"
+        with_write_lock e2e_restore_locked
         ;;
     invalid-restore)
         E2E_DROPIN="$E2E_ROOT/sshd_config.d/00-ssh-init-hardening.conf"

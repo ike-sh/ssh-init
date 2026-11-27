@@ -4,6 +4,15 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.5.8](https://github.com/ike-sh/ssh-init/releases/tag/v0.5.8) - 2026-11-27
+
+- GitHub / `gen` 加固将授权文件、`.ssh` 目录元数据、主配置、托管 drop-in、immutable 和 SSH 服务状态纳入同一事务。写操作互斥；中断后保留可检查、可重试的快照。
+- `sshd -t`、全局 `-T` 与目标用户 `-T -C` 分别检查语法和策略；校对授权路径、算法、认证链与用户/组限制。未确定的来源和外部认证单独提示，不自动改写用户策略。
+- 保留严格的 root 登录策略；放宽需另行输入 `ROOT`，`gen` 仍需 `SAVED`。优先安全 reload，保留 socket activation 与已有会话。
+- 按密钥类型与主体去重，保留旧授权选项和注释；原子替换授权文件，网络下载设连接与总时限。
+- 按操作批次恢复，不再组合不同批次各自最新的文件；无实际变更不留永久备份。保留旧备份并提示关联限制。
+- 实测结果及未验证范围见 [TEST_RESULTS.md](./TEST_RESULTS.md)。
+
 ## [v0.5.7] - 2026-09-06
 
 ### 升级注意

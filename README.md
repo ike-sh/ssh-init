@@ -14,10 +14,10 @@ curl -fsSL https://raw.githubusercontent.com/ike-sh/ssh-init/main/init.sh -o ini
 
 ## 固定版本/高级用法
 
-如果你想固定行为、不受 `main` 更新影响，可以使用 tag 版本。生产环境更建议固定 tag；普通用户可以直接用 `main`。
+如需固定行为、不受 `main` 更新影响，可直接下载正式 Tag `v0.5.8` 对应的脚本：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ike-sh/ssh-init/v0.5.7/init.sh -o init.sh && sh init.sh
+curl -fsSL https://raw.githubusercontent.com/ike-sh/ssh-init/v0.5.8/init.sh -o init.sh && sh init.sh
 ```
 
 运行后会看到：
@@ -47,7 +47,9 @@ GitHub 模式会从下面的公开地址拉取公钥：
 https://github.com/你的GitHub用户名.keys
 ```
 
-GitHub 上保存的是公钥，本地电脑保存的是私钥。脚本只会把有效公钥追加写入当前运行用户的 `~/.ssh/authorized_keys`，不会覆盖已有内容；完全相同的公钥行（含注释）不会重复写入。旧文件末尾没有换行时，脚本会先补换行，确保新公钥独占一行。
+GitHub 上保存的是公钥，本地电脑保存的是私钥。脚本只会把有效公钥追加写入当前运行用户的 `~/.ssh/authorized_keys`，不会覆盖已有内容；按公钥类型和密钥主体去重，注释不同也不重复导入。如果旧行有 `from=`、`command=`、`restrict` 等限制，保留原行，不再追加不限权的相同公钥。旧文件末尾没有换行时，脚本会先补换行，确保新公钥独占一行。
+
+下载连接限时 10 秒、总限时 30 秒；空响应、超限、传输失败或没有有效公钥均不修改登录配置。优先使用 curl；wget 回退要求可确认 HTTPS 证书及主机名验证，不接受重定向。仅有不认证证书的 BusyBox 内置 TLS 时，请使用 curl 或 GNU wget。
 
 添加 GitHub 公钥的步骤：
 
@@ -143,7 +145,7 @@ sh init.sh gen
 
 ## SSH 加固
 
-成功导入公钥后，脚本会备份并修改 `/etc/ssh/sshd_config`，确保以下配置生效：
+GitHub 和 `gen` 都在同一笔写事务内安装公钥并应用加固。默认全局策略如下：
 
 ```text
 PubkeyAuthentication yes
@@ -170,35 +172,17 @@ Include /etc/ssh/sshd_config.d/*.conf
 
 这样安全配置会在 `01-*`、`50-*` 等云厂商或发行版 drop-in 之前加载，避免被 OpenSSH 的 first obtained value 规则绕过。脚本不会删除用户已有的 drop-in 文件。
 
-脚本会在修改前备份：
+**原有 root 限制不会静默放宽。** 如果全局 `PermitRootLogin` 已为 `no` 或 `forced-commands-only`，默认保留；仅在单独的提示中输入 `ROOT` 才允许改成 `prohibit-password`。`SSH_INIT_ASSUME_YES=1` 不代表同意放宽。若能确定目标 root 的有效策略仍不允许普通密钥会话，操作会中止。脚本不改写 `Match`、`AllowUsers`、`DenyUsers`、组规则或外部密钥命令。
 
-```text
-/etc/ssh/sshd_config.bak.YYYYmmdd_HHMMSS
-~/.ssh/authorized_keys.bak.YYYYmmdd_HHMMSS
-```
+脚本分三步作静态判断：
 
-修改后会先执行 `sshd -t -f /etc/ssh/sshd_config` 做语法校验，再执行 `sshd -T -f /etc/ssh/sshd_config` 检查全局生效配置，确认全局密码登录关闭、公钥登录仍启用。如果配置不符合预期，脚本会恢复备份并停止，不会重启 SSH。
+1. 写入前读取现有配置和目标账号上下文；递归检查 `Include` 及 `Match`，识别授权文件、签名算法和认证链的明确冲突。`AuthorizedKeysFile` 按目标 HOME 解释相对路径，并展开 `%h`、`%u`、`%U` 和 `%%`。脚本不向不匹配的自定义目录擅自写入公钥。
+2. 写入后、服务应用前用 `sshd -t -f` 校验语法，`sshd -T -f` 检查全局结果，`sshd -T -C … -f` 检查目标用户。在已有 SSH 会话中采用可用的 `SSH_CONNECTION` 来源 IP、本机 IP 和端口；在控制台不会用虚构的远端地址冒充真实连接。不会执行 `AuthorizedKeysCommand`。多条 `AuthenticationMethods` 替代路径不等于每条都必须满足。
+3. 发现确定冲突即停止或回滚。外部密钥、客户端持有的其他凭据、DNS、未采样来源和复杂条件可能无法静态确定，提示后需分别验证。**这些检查不是 SSH 登录测试**；请保留当前连接，用另一终端从预期来源实测。
 
-不带 `-C` 的 `sshd -T` 不能验证每个用户、来源地址对应的 `Match` 条件。脚本会递归扫描全局及 `Match` 内的 `Include`，拦截危险认证链并提示条件覆盖，但不会自动改写 `Match` 策略。复杂条件配置仍需用 `sshd -T -C user=实际用户,host=实际来源主机名,addr=实际来源IP -f /etc/ssh/sshd_config` 分别检查，并测试真实登录。
+服务应用使用预先记录的服务名和运行状态，优先 reload。systemd 仅在能确认不会按控制组停止已有会话时回退 `try-restart`；SysV / OpenRC 的自定义停止脚本语义不可知，reload 失败不会盲目 restart。Ubuntu 的 socket activation 不会被关闭，原本休眠的服务不被强行拉起。脚本不修改端口、监听地址或防火墙。如果服务管理器不可查询，或文件/服务回滚失败，会明确报错，不宣称恢复成功。
 
-如果全局配置或 `Include` 引入的配置中存在 `AuthenticationMethods publickey,password` 或包含 `keyboard-interactive` 的多因素认证要求，脚本会中止加固。因为脚本会禁用 `password`/`keyboard-interactive`，继续执行可能导致 SSH 无法登录。请先手动改为 `AuthenticationMethods publickey`，或删除该项后重试。
-
-脚本不会自动修改 `Match` 块；如果 `Match` 块里覆盖了 `PasswordAuthentication yes`、`KbdInteractiveAuthentication yes`、`ChallengeResponseAuthentication yes`、`PubkeyAuthentication no` 或 `PermitRootLogin yes`，脚本会输出醒目警告，请确认特定用户或地址仍允许密码登录是否符合预期。
-
-最终校验通过后，脚本会按顺序尝试重启 SSH：
-
-```text
-systemctl restart ssh
-systemctl restart sshd
-service ssh restart
-service sshd restart
-rc-service ssh restart
-rc-service sshd restart
-```
-
-Ubuntu 上如果缺少 `/run/sshd`，脚本会自动创建并设置权限为 `755`。
-
-部分 NAT VPS 商家会用 `chattr +i /etc/ssh/sshd_config` 锁定 SSH 配置，防止用户误改端口导致端口转发失效。脚本检测到这种情况时会临时执行 `chattr -i` 解锁，只修改密钥登录相关配置，不会修改 `Port`，完成校验和重启后会尝试恢复 immutable 锁定状态。
+NAT VPS 上原本带 `chattr +i` 的操作目标在快照完成后才临时解锁；提交和回滚都处理原始 immutable 状态。文件系统不支持 `lsattr` 时不会假定能解锁；实际写入失败会中止；探测本身出现 I/O 错误也会中止。快照记录 Linux 的 mode、UID、GID 与文件内容，能保留 xattr 的 GNU cp 会显式复制扩展属性；仅提供基础 `cp -p` 的环境不保证自定义 ACL/xattr 的完整往返。托管写入路径不能是符号链接。
 
 ## 为什么提示“配置语法通过，但最终生效配置不符合预期”？
 
@@ -224,7 +208,7 @@ PasswordAuthentication yes
 
 OpenSSH 对同一关键字通常采用 first obtained value，所以只在主配置后面追加 `PasswordAuthentication no` 可能不生效。新版脚本会在可用时写入 `/etc/ssh/sshd_config.d/00-ssh-init-hardening.conf`，让安全配置优先加载，并继续通过 `sshd -T` 验证最终生效配置。
 
-如果存在危险配置，例如 `AuthenticationMethods publickey,password` 或 `AuthenticationMethods publickey,keyboard-interactive`，脚本仍会中止，避免禁用密码/键盘交互后把 SSH 登录链路锁死。
+如果目标用户所有可用认证链都与禁用密码/键盘交互冲突，会中止操作；仅其他用户的条件链或仍有 `publickey` 替代路径时，不会仅因扫描到了 `password` 字样就中止。
 
 执行成功后仍建议不要关闭当前 SSH 窗口，另开新窗口测试密钥登录。
 
@@ -253,21 +237,12 @@ grep -RInE '^[[:space:]]*(Include|PasswordAuthentication|KbdInteractiveAuthentic
 sh init.sh
 ```
 
-恢复菜单可以恢复最新的 `sshd_config` 备份、最新的 `authorized_keys` 备份，或同时恢复二者。恢复 `sshd_config` 后脚本会再次执行 `sshd -t` 并重启 SSH 服务。
+恢复子菜单 1/2 分别恢复配置（含对应托管 drop-in）或公钥；菜单 3 只选同时记录两项的**同一批次**。备份原来不存在的文件会恢复为“不存在”，并非恢复为空文件。清空授权文件仍需大写 `YES`，可能导致无法远程登录。
 
-如果加固时写入了 `/etc/ssh/sshd_config.d/00-ssh-init-hardening.conf`，恢复 `sshd_config` 时会同步处理该 drop-in 文件：有备份则恢复备份内容；若该文件是脚本新建且没有备份，则会移除该托管 drop-in 文件，避免主配置恢复后仍被 drop-in 保持加固状态。
-
-恢复前会记录主配置、受影响 drop-in 的内容及存在状态；校验、文件操作或服务重启失败时，按这些快照回滚。“同时恢复”中的 `authorized_keys` 失败也会撤销此次 SSH 配置变更，而不是重新选择历史 drop-in 备份。回滚仍可能因磁盘或权限故障失败，此时必须通过 VNC/Console 检查。
-
-“恢复最新备份”表示恢复到脚本上次修改前的状态。`authorized_keys` 恢复不是清空文件，而是恢复备份文件内容；如果恢复后仍有公钥行，说明备份中本来就有这些公钥。
-
-恢复菜单还提供“清空当前用户 authorized_keys（危险）”选项。这个操作会先创建：
-
-```text
-~/.ssh/authorized_keys.before-clear.YYYYmmdd_HHMMSS
-```
-
-然后清空当前用户所有 SSH 公钥。执行前必须输入大写 `YES`，不建议在没有 VNC/Console 的情况下使用。
+- 默认状态目录是 `/etc/ssh/sshd_config.ssh-init.d/`（随 `SSH_CONFIG` 路径变化），仅运行账户可访问。`batch.000000000001` 等目录保存同一操作前的快照：`*.path`、`*.meta`（存在状态或 mode、UID、GID、immutable）及 `*.data`。只在内容、存在性或必要元数据发生变化时保留批次，不自动清理历史备份。恢复本身若改变文件，也留下可撤销的批次。
+- v0.5.7 及更早的相邻 `.bak.*` 等备份保持不动。旧格式没有可靠批次标识；同时恢复只提供相同时间戳的候选，并明确提示仍不能证明它们同源。无法配对时选单项恢复，不拼接各自最新文件。
+- 写操作互斥；只读状态、诊断和帮助不取写锁。有 `flock` 时先取内核锁；两条路径共用同一个原子发布的持有者标记，不会因有的进程缺少 `flock` 而失去互斥。不要删除活动锁。若 PID 已被复用、无法读取 `/proc`，或清理死锁的进程本身也被强杀，则保守拒绝写入。请在 Console 先核实进程和 `lock` 指向的持有者目录；**不要删除 `pending` 快照**。
+- 捕获 HUP、INT、TERM 时尝试回滚；SIGKILL、断电或失败的回滚可能留下 `pending/active`。先保留该目录，通过 Console 查看 `*.path` 及对应文件。再次选择写操作时，只有输入 `RECOVER` 才会用快照恢复并退出本次操作；若中断后已人工编辑，请先另存这些改动。恢复后重新运行原命令。磁盘损坏、权限错误和外部服务变化不能由脚本保证修复。写锁只协调 ssh-init，操作期间不要同时用编辑器或其他配置管理工具写同一文件。
 
 命令行兼容模式：
 
@@ -296,6 +271,7 @@ sh init.sh --debug-effective
 
 ```sh
 sh tests/run.sh
+for suite in tests/*-v058.sh; do sh "$suite" || exit 1; done
 ```
 
 单元测试在专用临时目录中运行，默认阻止真实网络请求和服务管理命令。回归用例覆盖末尾换行、私钥保存确认、Include/Match 扫描与跨文件恢复失败。
@@ -308,4 +284,4 @@ sh tests/integration.sh
 
 该脚本使用临时主机密钥和配置，调用真实 `sshd -t` / `sshd -T -C`，不启动监听端口、不重启系统服务。部分发行版要求预先存在 `/run/sshd`。CI 单独运行这组检查；非 Linux 环境会明确跳过。它仍不能代替目标 VPS 上的新会话登录验证。
 
-最近一次 Docker 多发行版测试和内网服务器独立 SSH 实例的真实登录验证结果见 [TEST_RESULTS.md](./TEST_RESULTS.md)。`tests/remote-sandbox.sh` 仅供已准备好安全临时目录和备用 sshd 的测试驱动调用，不要用它操作生产配置或 22 端口监听进程。
+当前版本的隔离测试记录、未验证范围以及前一版本的历史结果见 [TEST_RESULTS.md](./TEST_RESULTS.md)。`tests/remote-sandbox.sh` 仅供已准备好安全临时目录和备用 sshd 的测试驱动调用，不要用它操作生产配置或 22 端口监听进程。

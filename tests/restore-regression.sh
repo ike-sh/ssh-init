@@ -23,22 +23,27 @@ restore_regression_case() {
         cp "$restore_case_dropin" "$restore_case_dir/dropin-before" || exit 1
         cp "$restore_case_auth" "$restore_case_dir/auth-before" || exit 1
 
-        # All four hooks are invoked indirectly by the sourced implementation.
+        # Hooks are called by the sourced restore transaction, not this script.
         # shellcheck disable=SC2317,SC2329
         require_root() { return 0; }
         # shellcheck disable=SC2317,SC2329
-        unlock_immutable_if_needed() { SSHD_CONFIG_WAS_IMMUTABLE=0; }
-        # shellcheck disable=SC2317,SC2329
         validate_sshd_config() { ! grep -q '^Broken yes$' "$SSH_CONFIG"; }
         # shellcheck disable=SC2317,SC2329
+        ssh_service_snapshot() { printf '%s\n' legacy-fixture; }
+        # shellcheck disable=SC2317,SC2329
         restart_ssh_service() {
-            printf '%s\n' 'restart' >> "$restore_case_dir/restarts"
-            case "$restore_case_kind" in
-                restart-fail|both-restart-fail)
-                    [ "$(wc -l < "$restore_case_dir/restarts" | tr -d ' ')" -gt 1 ]
-                    ;;
-                *) return 0 ;;
-            esac
+            [ "$#" = 1 ] && [ "$1" = legacy-fixture ] || return 1
+            printf '%s\n' apply >> "$restore_case_dir/restarts"
+            case "$restore_case_kind" in restart-fail|both-restart-fail) return 1 ;; esac
+            return 0
+        }
+        # shellcheck disable=SC2317,SC2329
+        ssh_service_restore() {
+            [ "$#" = 1 ] && [ "$1" = legacy-fixture ] || return 1
+            cmp -s "$SSH_CONFIG" "$restore_case_dir/main-before" || return 1
+            cmp -s "$restore_case_dropin" "$restore_case_dir/dropin-before" || return 1
+            cmp -s "$restore_case_auth" "$restore_case_dir/auth-before" || return 1
+            printf '%s\n' restore >> "$restore_case_dir/restarts"
         }
         # shellcheck disable=SC2317,SC2329
         show_effective_ssh_config() { printf '%s\n' 'passwordauthentication no' 'permitrootlogin prohibit-password'; }
@@ -60,8 +65,9 @@ restore_regression_case() {
                 if [ "$restore_case_kind" = both-auth-missing ]; then rm -f "$restore_case_auth"; fi
                 # Simulate a partial write followed by an I/O or metadata error.
                 # shellcheck disable=SC2317,SC2329
-                restore_authorized_keys_from_backup() {
-                    printf '%s\n' 'partial replacement' > "$restore_case_auth"
+                restore_legacy_auth_install() {
+                    [ "$2" = "$restore_case_auth" ] && tx_touch auth || return 1
+                    printf '%s\n' 'partial replacement' > "$2"
                     return 1
                 }
                 if restore_sshd_and_authorized_keys_from_backups "$restore_case_backup" "$restore_case_auth.bak.test"; then exit 1; fi

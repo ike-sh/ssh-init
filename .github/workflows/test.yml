@@ -15,22 +15,31 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
 
-      - name: Shellcheck scripts
-        run: shellcheck -x -e SC2034,SC2086,SC2012 init.sh tests/*.sh tests/fixtures/*.sh
+      - name: Check POSIX shell syntax and lint
+        run: |
+          for script in init.sh tests/*.sh tests/fixtures/*.sh; do sh -n "$script" || exit 1; done
+          shellcheck -x -e SC2034,SC2086,SC2012 init.sh tests/*.sh tests/fixtures/*.sh
 
-      - name: Run test suite
+      - name: Run legacy regressions
         run: sh tests/run.sh
+
+      - name: Run independent v0.5.8 regression suites
+        run: |
+          for suite in auth service keys txn batch; do sh "tests/$suite-v058.sh" || exit 1; done
 
   openssh-integration:
     runs-on: ubuntu-latest
+    container: ubuntu:24.04
     steps:
+      - name: Prepare disposable parser-only OpenSSH environment
+        run: |
+          printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+          chmod 755 /usr/sbin/policy-rc.d
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates openssh-server
+          install -d -m 0755 /run/sshd
+
       - uses: actions/checkout@v4
 
-      - name: Install OpenSSH test dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y openssh-server
-          sudo install -d -m 0755 /run/sshd
-
       - name: Check real OpenSSH configuration semantics
-        run: sudo sh tests/integration.sh
+        run: sh tests/integration.sh

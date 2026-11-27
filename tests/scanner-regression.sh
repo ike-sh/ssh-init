@@ -74,9 +74,10 @@ scanner_regression_case() {
                 SSH_CONFIG=$scanner_config
                 IKE_TEST_UID=0
                 cp "$scanner_config" "$scanner_case_dir/before" || exit 1
-                if (harden_ssh_config); then exit 1; fi
+                if (harden_ssh_config) > "$scanner_case_dir/reject" 2>&1; then exit 1; fi
+                grep -q '无法完整检查 SSH 配置文件或 Include' "$scanner_case_dir/reject" || exit 1
                 cmp -s "$scanner_config" "$scanner_case_dir/before" || exit 1
-                [ "$(find "$scanner_case_dir" -name 'sshd_config.bak.*' | wc -l | tr -d ' ')" = 0 ] || exit 1
+                [ "$(permanent_backup_count "$scanner_case_dir")" = 0 ] || exit 1
                 ;;
             malformed)
                 printf '%s\n' 'Include "unterminated' > "$scanner_config"

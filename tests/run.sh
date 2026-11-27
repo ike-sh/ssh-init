@@ -14,7 +14,12 @@ TEST_ROOT=$(CDPATH=; cd "$TEST_ROOT" && pwd -P)
 TMPDIR=$TEST_ROOT
 SSH_CONFIG="$TEST_ROOT/sshd_config"
 RUN_SSHD_DIR="$TEST_ROOT/run/sshd"
-export TMPDIR SSH_CONFIG RUN_SSHD_DIR
+# Never resolve the real login home for standalone hardening or restore discovery.
+IKE_TEST_USER=testuser
+IKE_TEST_HOME=$TEST_ROOT/home
+unset SSH_CONNECTION SSH_CLIENT
+mkdir -p "$IKE_TEST_HOME/.ssh"
+export TMPDIR SSH_CONFIG RUN_SSHD_DIR IKE_TEST_USER IKE_TEST_HOME
 mkdir "$TEST_ROOT/bin"
 for test_command in curl wget sshd systemctl service rc-service chattr lsattr; do
     cp "$ROOT_DIR/tests/fixtures/blocked-command.sh" "$TEST_ROOT/bin/$test_command"
@@ -57,6 +62,10 @@ fail() {
     printf '%s\n' "not ok - $1" >&2
 }
 
+permanent_backup_count() {
+    find "$1" \( -name 'batch.*' -o -name '*.bak.*' -o -name '*.before-clear.*' -o -name '*.before-restore.*' \) -print | wc -l | tr -d ' '
+}
+
 make_test_dir() {
     mktemp -d "${TMPDIR:-/tmp}/ssh-init-test.XXXXXX"
 }
@@ -71,7 +80,9 @@ setup_home() {
 }
 
 clear_test_user() {
-    unset IKE_TEST_USER IKE_TEST_HOME IKE_TEST_UID
+    IKE_TEST_USER=testuser
+    IKE_TEST_HOME=$TEST_ROOT/home
+    unset IKE_TEST_UID
 }
 
 write_keys_file() {
@@ -553,15 +564,15 @@ test_sshd_t_failure_restores_backup() {
     IKE_TEST_UID=0
     export IKE_TEST_UID
     printf '%s\n' "PasswordAuthentication yes" > "$SSH_CONFIG"
-    cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
-#!/bin/sh
-exit 1
-MOCK_SSHD
+    cp "$SSH_CONFIG" "$tmp/main-before"
+    make_mock_sshd_policy "$tmp/bin" syntax-fail
     chmod +x "$tmp/bin/sshd"
+    make_mock_restart_success "$tmp/bin"
     PATH="$tmp/bin:$PATH"
     if (harden_ssh_config >/dev/null 2>&1); then
         fail "sshd -t failure restores backup"
-    elif grep -q '^PasswordAuthentication yes$' "$SSH_CONFIG"; then
+    elif grep -q '^-t ' "$tmp/bin/sshd-calls" && cmp -s "$SSH_CONFIG" "$tmp/main-before" &&
+        [ "$(permanent_backup_count "$tmp")" = 0 ]; then
         pass "sshd -t failure restores backup"
     else
         fail "sshd -t failure restores backup"
@@ -584,14 +595,9 @@ test_restart_failure_restores_backup() {
     IKE_TEST_UID=0
     export IKE_TEST_UID
     printf '%s\n' "PasswordAuthentication yes" > "$SSH_CONFIG"
-    cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
-#!/bin/sh
-exit 0
-MOCK_SSHD
-    cat > "$tmp/bin/systemctl" <<'MOCK_SYSTEMCTL'
-#!/bin/sh
-exit 1
-MOCK_SYSTEMCTL
+    cp "$SSH_CONFIG" "$tmp/main-before"
+    make_mock_sshd_policy "$tmp/bin" restart-fail
+    make_mock_restart_success "$tmp/bin"
     cat > "$tmp/bin/service" <<'MOCK_SERVICE'
 #!/bin/sh
 exit 1
@@ -601,10 +607,13 @@ MOCK_SERVICE
 exit 1
 MOCK_RC
     chmod +x "$tmp/bin/sshd" "$tmp/bin/systemctl" "$tmp/bin/service" "$tmp/bin/rc-service"
+    : > "$tmp/bin/fail-first-reload"
+    RESTART_LOG="$tmp/restarts"; export RESTART_LOG
     PATH="$tmp/bin:$PATH"
     if (harden_ssh_config >/dev/null 2>&1); then
         fail "restart failure restores backup"
-    elif grep -q '^PasswordAuthentication yes$' "$SSH_CONFIG"; then
+    elif grep -Fxq 'reload ssh.service' "$RESTART_LOG" && cmp -s "$SSH_CONFIG" "$tmp/main-before" &&
+        [ "$(permanent_backup_count "$tmp")" = 0 ]; then
         pass "restart failure restores backup"
     else
         fail "restart failure restores backup"
@@ -612,7 +621,7 @@ MOCK_RC
     PATH=$old_path
     SSH_CONFIG=$old_ssh_config
     RUN_SSHD_DIR=$old_run_sshd_dir
-    unset IKE_TEST_UID
+    unset IKE_TEST_UID RESTART_LOG
     rm -rf "$tmp"
 }
 
@@ -632,47 +641,9 @@ test_effective_include_password_yes_fails() {
         printf '%s\n' "PasswordAuthentication no"
     } > "$SSH_CONFIG"
     printf '%s\n' "PasswordAuthentication yes" > "$include"
-    cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
-#!/bin/sh
-mode=""
-config=""
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        -T)
-            mode="T"
-            shift
-            ;;
-        -t)
-            mode="t"
-            shift
-            ;;
-        -f)
-            config="$2"
-            shift 2
-            ;;
-        *)
-            shift
-            ;;
-    esac
-done
-if [ "$mode" = "T" ]; then
-    include=$(awk 'tolower($1) == "include" { print $2; exit }' "$config")
-    if [ -n "$include" ] && grep -q '^PasswordAuthentication yes$' "$include"; then
-        printf '%s\n' "pubkeyauthentication yes"
-        printf '%s\n' "passwordauthentication yes"
-        printf '%s\n' "kbdinteractiveauthentication no"
-        printf '%s\n' "permitemptypasswords no"
-        printf '%s\n' "permitrootlogin prohibit-password"
-        exit 0
-    fi
-fi
-exit 0
-MOCK_SSHD
-    cat > "$tmp/bin/systemctl" <<'MOCK_SYSTEMCTL'
-#!/bin/sh
-printf '%s\n' "restart" >> "$RESTART_LOG"
-exit 0
-MOCK_SYSTEMCTL
+    cp "$SSH_CONFIG" "$tmp/main-before"
+    make_mock_sshd_policy "$tmp/bin" include-password
+    make_mock_restart_success "$tmp/bin"
     chmod +x "$tmp/bin/sshd" "$tmp/bin/systemctl"
     RESTART_LOG="$tmp/restart.log"
     export RESTART_LOG
@@ -681,7 +652,8 @@ MOCK_SYSTEMCTL
         fail "effective Include password yes fails"
     elif grep -q "最终生效配置不符合预期" "$tmp/out" &&
         grep -q "^Include $include$" "$SSH_CONFIG" &&
-        [ ! -s "$RESTART_LOG" ]; then
+        cmp -s "$SSH_CONFIG" "$tmp/main-before" &&
+        [ "$(permanent_backup_count "$tmp")" = 0 ] && [ ! -s "$RESTART_LOG" ]; then
         pass "effective Include password yes fails"
     else
         fail "effective Include password yes fails"
@@ -693,63 +665,81 @@ MOCK_SYSTEMCTL
     rm -rf "$tmp"
 }
 
-make_mock_sshd_dropin_aware() {
-    bin_dir="$1"
-    cat > "$bin_dir/sshd" <<'MOCK_SSHD'
+# Only actual service mutations enter RESTART_LOG, never read-only probes.
+make_mock_restart_success() {
+    cat > "$1/systemctl" <<'MOCK_SYSTEMCTL'
 #!/bin/sh
-mode=""
-config=""
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        -T)
-            mode="T"
-            shift
-            ;;
-        -t)
-            mode="t"
-            shift
-            ;;
-        -f)
-            config="$2"
-            shift 2
-            ;;
-        *)
-            shift
-            ;;
-    esac
-done
-if [ "$mode" = "T" ]; then
-    pattern=$(awk 'tolower($1) == "include" { print $2; exit }' "$config")
-    dir=${pattern%/*}
-    if [ -f "$dir/00-ssh-init-hardening.conf" ]; then
-        printf '%s\n' "permitrootlogin without-password"
-        printf '%s\n' "pubkeyauthentication yes"
-        printf '%s\n' "passwordauthentication no"
-        printf '%s\n' "kbdinteractiveauthentication no"
-        printf '%s\n' "permitemptypasswords no"
-        printf '%s\n' "authenticationmethods any"
-        exit 0
-    fi
-    printf '%s\n' "permitrootlogin yes"
-    printf '%s\n' "pubkeyauthentication yes"
-    printf '%s\n' "passwordauthentication yes"
-    printf '%s\n' "kbdinteractiveauthentication no"
-    printf '%s\n' "permitemptypasswords no"
-    printf '%s\n' "authenticationmethods any"
-fi
-exit 0
-MOCK_SSHD
-    chmod +x "$bin_dir/sshd"
+case "$*" in
+    'show -p Version') printf '%s\n' Version=255 ;;
+    'show -p Id -p LoadState -p ActiveState '*)
+        for unit do :; done
+        case "$unit" in
+            ssh.service) printf '%s\n' Id=ssh.service LoadState=loaded ActiveState=active SubState=running ;;
+            ssh.socket|sshd.service|sshd.socket) printf '%s\n' "Id=$unit" LoadState=not-found ActiveState=inactive SubState=dead ;;
+            *) exit 125 ;;
+        esac ;;
+    'show -p CanReload -p KillMode -p ExecStop -p ExecStopPost ssh.service')
+        printf '%s\n' CanReload=yes KillMode=control-group ExecStop= ExecStopPost= ;;
+    'reload ssh.service')
+        [ -z "${RESTART_LOG:-}" ] || printf '%s\n' "$*" >> "$RESTART_LOG"
+        if [ -f "${0%/*}/fail-first-reload" ]; then rm -f "${0%/*}/fail-first-reload"; exit 1; fi ;;
+    *) printf 'unexpected systemctl arguments: %s\n' "$*" >&2; exit 125 ;;
+esac
+MOCK_SYSTEMCTL
+    chmod +x "$1/systemctl"
 }
 
-make_mock_restart_success() {
-    bin_dir="$1"
-    cat > "$bin_dir/systemctl" <<'MOCK_SYSTEMCTL'
+# Preflight, syntax validation and final policy can fail independently. Actual
+# OpenSSH (including Include order and Match selection) runs in integration.sh.
+make_mock_sshd_policy() {
+    printf '%s\n' "$2" > "$1/policy-case"
+    cat > "$1/sshd" <<'MOCK_SSHD'
 #!/bin/sh
-printf '%s\n' "restart" >> "$RESTART_LOG"
-exit 0
-MOCK_SYSTEMCTL
-    chmod +x "$bin_dir/systemctl"
+set -eu
+kind=$(cat "${0%/*}/policy-case")
+mode= config= ctx=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -t|-T) mode=$1; shift ;;
+        -f) config=$2; shift 2 ;;
+        -C) ctx=$2; shift 2 ;;
+        *) exit 125 ;;
+    esac
+done
+[ -f "$config" ] || exit 1
+printf '%s %s %s\n' "$mode" "$config" "$ctx" >> "${0%/*}/sshd-calls"
+case "$mode" in
+    -t) [ "$kind" != syntax-fail ]; exit ;;
+    -T) ;;
+    *) exit 125 ;;
+esac
+password=yes; root=prohibit-password; methods=any
+if grep -q '^PubkeyAuthentication yes$' "$config"; then
+    password=no
+    case "$kind" in
+        effective-fail) root=yes; password=yes ;;
+        effective-unreadable) exit 1 ;;
+        include-password)
+            early=$(awk 'tolower($1)=="include" {print $2;exit}' "$config")
+            if grep -qx 'PasswordAuthentication yes' "$early"; then password=yes; fi ;;
+        dropin)
+            pattern=$(awk 'tolower($1)=="include" {print $2;exit}' "$config")
+            if [ ! -f "${pattern%/*}/00-ssh-init-hardening.conf" ]; then password=yes; root=yes; fi ;;
+    esac
+fi
+case "$kind" in
+    auth-password|auth-keyboard)
+        pattern=$(awk 'tolower($1)=="include" {print $2;exit}' "$config")
+        IFS=''; set -- $pattern; methods=$(awk 'tolower($1)=="authenticationmethods" {print $2;exit}' "$1") ;;
+    auth-match)
+        case ",$ctx," in *,user=testuser,*) methods=publickey,password ;; esac ;;
+esac
+printf '%s\n' "permitrootlogin $root" "passwordauthentication $password" \
+    'pubkeyauthentication yes' 'kbdinteractiveauthentication no' 'permitemptypasswords no' \
+    "authenticationmethods $methods" 'authorizedkeysfile .ssh/authorized_keys' \
+    'authorizedkeyscommand none' 'pubkeyacceptedalgorithms ssh-ed25519,rsa-sha2-256'
+MOCK_SSHD
+    chmod +x "$1/sshd"
 }
 
 test_dropin_permitrootlogin_success() {
@@ -767,7 +757,7 @@ test_dropin_permitrootlogin_success() {
         printf '%s\n' "KbdInteractiveAuthentication no"
     } > "$SSH_CONFIG"
     printf '%s\n' "PermitRootLogin yes" > "$tmp/sshd_config.d/01-permitrootlogin.conf"
-    make_mock_sshd_dropin_aware "$tmp/bin"
+    make_mock_sshd_policy "$tmp/bin" dropin
     make_mock_restart_success "$tmp/bin"
     RESTART_LOG="$tmp/restart.log"
     export RESTART_LOG
@@ -801,7 +791,7 @@ test_dropin_cloud_init_success() {
     export IKE_TEST_UID
     printf '%s\n' "Include $tmp/sshd_config.d/*.conf" > "$SSH_CONFIG"
     printf '%s\n' "PasswordAuthentication yes" > "$tmp/sshd_config.d/50-cloud-init.conf"
-    make_mock_sshd_dropin_aware "$tmp/bin"
+    make_mock_sshd_policy "$tmp/bin" dropin
     make_mock_restart_success "$tmp/bin"
     RESTART_LOG="$tmp/restart.log"
     export RESTART_LOG
@@ -832,22 +822,10 @@ test_existing_dropin_failure_restores_backup() {
     IKE_TEST_UID=0
     export IKE_TEST_UID
     printf '%s\n' "Include $tmp/sshd_config.d/*.conf" > "$SSH_CONFIG"
-    printf '%s\n' "old managed content" > "$tmp/sshd_config.d/00-ssh-init-hardening.conf"
-    cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
-#!/bin/sh
-while [ "$#" -gt 0 ]; do
-    if [ "$1" = "-T" ]; then
-        printf '%s\n' "permitrootlogin yes"
-        printf '%s\n' "pubkeyauthentication yes"
-        printf '%s\n' "passwordauthentication yes"
-        printf '%s\n' "kbdinteractiveauthentication no"
-        printf '%s\n' "permitemptypasswords no"
-        exit 0
-    fi
-    shift
-done
-exit 0
-MOCK_SSHD
+    printf '%s\n' "# Managed by ssh-init." "old managed content" > "$tmp/sshd_config.d/00-ssh-init-hardening.conf"
+    cp "$SSH_CONFIG" "$tmp/main-before"
+    cp "$tmp/sshd_config.d/00-ssh-init-hardening.conf" "$tmp/drop-before"
+    make_mock_sshd_policy "$tmp/bin" effective-fail
     make_mock_restart_success "$tmp/bin"
     chmod +x "$tmp/bin/sshd"
     RESTART_LOG="$tmp/restart.log"
@@ -855,11 +833,13 @@ MOCK_SSHD
     PATH="$tmp/bin:$PATH"
     if (harden_ssh_config > "$tmp/out" 2>&1); then
         fail "existing 00 drop-in is restored after effective failure"
-    elif grep -q '^old managed content$' "$tmp/sshd_config.d/00-ssh-init-hardening.conf" &&
+    elif grep -q 'passwordauthentication: 期望 no，实际 yes' "$tmp/out" &&
+        grep -q '^old managed content$' "$tmp/sshd_config.d/00-ssh-init-hardening.conf" &&
         ! grep -q '^PasswordAuthentication no$' "$tmp/sshd_config.d/00-ssh-init-hardening.conf" &&
         ! grep -q '^PasswordAuthentication no$' "$SSH_CONFIG" &&
-        [ "$(find "$tmp/sshd_config.d" -name '00-ssh-init-hardening.conf.bak.*' | wc -l | awk '{print $1}')" = "1" ] &&
-        [ ! -s "$RESTART_LOG" ]; then
+        cmp -s "$SSH_CONFIG" "$tmp/main-before" &&
+        cmp -s "$tmp/sshd_config.d/00-ssh-init-hardening.conf" "$tmp/drop-before" &&
+        [ "$(permanent_backup_count "$tmp")" = 0 ] && [ ! -s "$RESTART_LOG" ]; then
         pass "existing 00 drop-in is restored after effective failure"
     else
         fail "existing 00 drop-in is restored after effective failure"
@@ -882,21 +862,8 @@ test_new_dropin_failure_removes_file() {
     IKE_TEST_UID=0
     export IKE_TEST_UID
     printf '%s\n' "Include $tmp/sshd_config.d/*.conf" > "$SSH_CONFIG"
-    cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
-#!/bin/sh
-while [ "$#" -gt 0 ]; do
-    if [ "$1" = "-T" ]; then
-        printf '%s\n' "permitrootlogin yes"
-        printf '%s\n' "pubkeyauthentication yes"
-        printf '%s\n' "passwordauthentication yes"
-        printf '%s\n' "kbdinteractiveauthentication no"
-        printf '%s\n' "permitemptypasswords no"
-        exit 0
-    fi
-    shift
-done
-exit 0
-MOCK_SSHD
+    cp "$SSH_CONFIG" "$tmp/main-before"
+    make_mock_sshd_policy "$tmp/bin" effective-fail
     make_mock_restart_success "$tmp/bin"
     chmod +x "$tmp/bin/sshd"
     RESTART_LOG="$tmp/restart.log"
@@ -904,9 +871,11 @@ MOCK_SSHD
     PATH="$tmp/bin:$PATH"
     if (harden_ssh_config > "$tmp/out" 2>&1); then
         fail "new 00 drop-in is removed after effective failure"
-    elif [ ! -e "$tmp/sshd_config.d/00-ssh-init-hardening.conf" ] &&
+    elif grep -q 'passwordauthentication: 期望 no，实际 yes' "$tmp/out" &&
+        [ ! -e "$tmp/sshd_config.d/00-ssh-init-hardening.conf" ] &&
         ! grep -q '^PasswordAuthentication no$' "$SSH_CONFIG" &&
-        [ ! -s "$RESTART_LOG" ]; then
+        cmp -s "$SSH_CONFIG" "$tmp/main-before" &&
+        [ "$(permanent_backup_count "$tmp")" = 0 ] && [ ! -s "$RESTART_LOG" ]; then
         pass "new 00 drop-in is removed after effective failure"
     else
         fail "new 00 drop-in is removed after effective failure"
@@ -929,21 +898,8 @@ test_effective_failure_lists_items() {
     IKE_TEST_UID=0
     export IKE_TEST_UID
     printf '%s\n' "PasswordAuthentication yes" > "$SSH_CONFIG"
-    cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
-#!/bin/sh
-while [ "$#" -gt 0 ]; do
-    if [ "$1" = "-T" ]; then
-        printf '%s\n' "permitrootlogin yes"
-        printf '%s\n' "passwordauthentication yes"
-        printf '%s\n' "pubkeyauthentication yes"
-        printf '%s\n' "kbdinteractiveauthentication no"
-        printf '%s\n' "permitemptypasswords no"
-        exit 0
-    fi
-    shift
-done
-exit 0
-MOCK_SSHD
+    cp "$SSH_CONFIG" "$tmp/main-before"
+    make_mock_sshd_policy "$tmp/bin" effective-fail
     make_mock_restart_success "$tmp/bin"
     chmod +x "$tmp/bin/sshd"
     RESTART_LOG="$tmp/restart.log"
@@ -954,7 +910,8 @@ MOCK_SSHD
     elif grep -q "passwordauthentication: 期望 no，实际 yes" "$tmp/out" &&
         grep -q "permitrootlogin: 期望 prohibit-password/without-password，实际 yes" "$tmp/out" &&
         grep -q "也可能是 Match 块根据用户、地址或组覆盖了全局配置" "$tmp/out" &&
-        [ ! -s "$RESTART_LOG" ]; then
+        cmp -s "$SSH_CONFIG" "$tmp/main-before" &&
+        [ "$(permanent_backup_count "$tmp")" = 0 ] && [ ! -s "$RESTART_LOG" ]; then
         pass "effective failure output lists mismatched keys"
     else
         fail "effective failure output lists mismatched keys"
@@ -976,16 +933,25 @@ test_authentication_methods_blocks_hardening() {
     export IKE_TEST_UID
     printf '%s\n' "Include $include" > "$SSH_CONFIG"
     printf '%s\n' "AuthenticationMethods publickey,password" > "$include"
+    old_path=$PATH
+    mkdir -p "$tmp/bin"
+    cp "$SSH_CONFIG" "$tmp/main-before"
+    make_mock_sshd_policy "$tmp/bin" auth-password
+    make_mock_restart_success "$tmp/bin"
+    PATH="$tmp/bin:$PATH"
     if (harden_ssh_config > "$tmp/out" 2>&1); then
         fail "AuthenticationMethods publickey,password blocks hardening"
-    elif grep -q "AuthenticationMethods publickey,password" "$tmp/out" &&
+    elif grep -iq "AuthenticationMethods publickey,password" "$tmp/out" &&
         grep -q "继续可能导致 SSH 无法登录" "$tmp/out" &&
         grep -q "AuthenticationMethods 改为 publickey" "$tmp/out" &&
-        [ "$(find "$tmp" -name 'sshd_config.bak.*' | wc -l | awk '{print $1}')" = "0" ]; then
+        cmp -s "$SSH_CONFIG" "$tmp/main-before" &&
+        grep -q -- "-T " "$tmp/bin/sshd-calls" &&
+        [ "$(permanent_backup_count "$tmp")" = 0 ]; then
         pass "AuthenticationMethods publickey,password blocks hardening"
     else
         fail "AuthenticationMethods publickey,password blocks hardening"
     fi
+    PATH=$old_path
     SSH_CONFIG=$old_ssh_config
     unset IKE_TEST_UID
     rm -rf "$tmp"
@@ -1001,16 +967,24 @@ test_authentication_methods_keyboard_interactive_blocks_hardening() {
     export IKE_TEST_UID
     printf '%s\n' "Include $tmp/sshd_config.d/*.conf" > "$SSH_CONFIG"
     printf '%s\n' "AuthenticationMethods publickey,keyboard-interactive" > "$include"
+    old_path=$PATH
+    mkdir -p "$tmp/bin"
+    cp "$SSH_CONFIG" "$tmp/main-before"
+    make_mock_sshd_policy "$tmp/bin" auth-keyboard
+    make_mock_restart_success "$tmp/bin"
+    PATH="$tmp/bin:$PATH"
     if (harden_ssh_config > "$tmp/out" 2>&1); then
         fail "AuthenticationMethods publickey,keyboard-interactive blocks hardening"
-    elif grep -q "AuthenticationMethods publickey,keyboard-interactive" "$tmp/out" &&
+    elif grep -iq "AuthenticationMethods publickey,keyboard-interactive" "$tmp/out" &&
         grep -q "脚本会禁用 password / keyboard-interactive" "$tmp/out" &&
+        cmp -s "$SSH_CONFIG" "$tmp/main-before" &&
         [ ! -e "$tmp/sshd_config.d/00-ssh-init-hardening.conf" ] &&
-        [ "$(find "$tmp" -name 'sshd_config.bak.*' | wc -l | awk '{print $1}')" = "0" ]; then
+        [ "$(permanent_backup_count "$tmp")" = 0 ]; then
         pass "AuthenticationMethods publickey,keyboard-interactive blocks hardening"
     else
         fail "AuthenticationMethods publickey,keyboard-interactive blocks hardening"
     fi
+    PATH=$old_path
     SSH_CONFIG=$old_ssh_config
     unset IKE_TEST_UID
     rm -rf "$tmp"
@@ -1054,21 +1028,8 @@ test_match_password_yes_warns_and_preserves() {
         printf '%s\n' "Match User deploy"
         printf '%s\n' "    PasswordAuthentication yes"
     } > "$SSH_CONFIG"
-    cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
-#!/bin/sh
-if [ "$1" = "-T" ]; then
-    printf '%s\n' "pubkeyauthentication yes"
-    printf '%s\n' "passwordauthentication no"
-    printf '%s\n' "kbdinteractiveauthentication no"
-    printf '%s\n' "permitemptypasswords no"
-    printf '%s\n' "permitrootlogin prohibit-password"
-fi
-exit 0
-MOCK_SSHD
-    cat > "$tmp/bin/systemctl" <<'MOCK_SYSTEMCTL'
-#!/bin/sh
-exit 0
-MOCK_SYSTEMCTL
+    make_mock_sshd_policy "$tmp/bin" ok
+    make_mock_restart_success "$tmp/bin"
     chmod +x "$tmp/bin/sshd" "$tmp/bin/systemctl"
     PATH="$tmp/bin:$PATH"
     if harden_ssh_config > "$tmp/out" 2>&1 &&
@@ -1097,26 +1058,17 @@ test_atomic_write_failure_restores_backup() {
     IKE_TEST_UID=0
     export IKE_TEST_UID
     printf '%s\n' "PasswordAuthentication yes" > "$SSH_CONFIG"
-    cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
-#!/bin/sh
-if [ "$1" = "-T" ]; then
-    printf '%s\n' "pubkeyauthentication yes"
-    printf '%s\n' "passwordauthentication no"
-    printf '%s\n' "kbdinteractiveauthentication no"
-    printf '%s\n' "permitemptypasswords no"
-    printf '%s\n' "permitrootlogin prohibit-password"
-fi
-exit 0
-MOCK_SSHD
+    cp "$SSH_CONFIG" "$tmp/main-before"
+    make_mock_sshd_policy "$tmp/bin" ok
     cat > "$tmp/bin/mv" <<'MOCK_MV'
 #!/bin/sh
-exit 1
+for dest do :; done
+if [ "$dest" = "$SSH_CONFIG" ] && [ ! -f "${0%/*}/failed-mv" ]; then
+    : > "${0%/*}/failed-mv"; exit 1
+fi
+exec /bin/mv "$@"
 MOCK_MV
-    cat > "$tmp/bin/systemctl" <<'MOCK_SYSTEMCTL'
-#!/bin/sh
-printf '%s\n' "restart" >> "$RESTART_LOG"
-exit 0
-MOCK_SYSTEMCTL
+    make_mock_restart_success "$tmp/bin"
     chmod +x "$tmp/bin/sshd" "$tmp/bin/mv" "$tmp/bin/systemctl"
     RESTART_LOG="$tmp/restart.log"
     export RESTART_LOG
@@ -1124,8 +1076,9 @@ MOCK_SYSTEMCTL
     if (harden_ssh_config > "$tmp/out" 2>&1); then
         fail "atomic write failure restores backup"
     elif grep -q '^PasswordAuthentication yes$' "$SSH_CONFIG" &&
-        grep -q "写入 SSH 配置失败，已恢复备份" "$tmp/out" &&
-        [ ! -s "$RESTART_LOG" ]; then
+        [ -f "$tmp/bin/failed-mv" ] &&
+        cmp -s "$SSH_CONFIG" "$tmp/main-before" &&
+        [ "$(permanent_backup_count "$tmp")" = 0 ] && [ ! -s "$RESTART_LOG" ]; then
         pass "atomic write failure restores backup"
     else
         fail "atomic write failure restores backup"
@@ -1148,30 +1101,18 @@ test_effective_sshd_T_failure_restores_backup() {
     IKE_TEST_UID=0
     export IKE_TEST_UID
     printf '%s\n' "PasswordAuthentication yes" > "$SSH_CONFIG"
-    cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
-#!/bin/sh
-while [ "$#" -gt 0 ]; do
-    if [ "$1" = "-T" ]; then
-        exit 1
-    fi
-    shift
-done
-exit 0
-MOCK_SSHD
-    cat > "$tmp/bin/systemctl" <<'MOCK_SYSTEMCTL'
-#!/bin/sh
-printf '%s\n' "restart" >> "$RESTART_LOG"
-exit 0
-MOCK_SYSTEMCTL
-    chmod +x "$tmp/bin/sshd" "$tmp/bin/systemctl"
     RESTART_LOG="$tmp/restart.log"
     export RESTART_LOG
+    cp "$SSH_CONFIG" "$tmp/main-before"
+    make_mock_sshd_policy "$tmp/bin" effective-unreadable
+    make_mock_restart_success "$tmp/bin"
     PATH="$tmp/bin:$PATH"
     if (harden_ssh_config > "$tmp/out" 2>&1); then
         fail "sshd -T failure restores backup"
     elif grep -q '^PasswordAuthentication yes$' "$SSH_CONFIG" &&
         grep -q "sshd -T 无法读取最终配置" "$tmp/out" &&
-        [ ! -s "$RESTART_LOG" ]; then
+        cmp -s "$SSH_CONFIG" "$tmp/main-before" &&
+        [ "$(permanent_backup_count "$tmp")" = 0 ] && [ ! -s "$RESTART_LOG" ]; then
         pass "sshd -T failure restores backup"
     else
         fail "sshd -T failure restores backup"
@@ -1207,10 +1148,7 @@ test_restore_sshd_restores_existing_dropin_backup() {
 #!/bin/sh
 exit 0
 MOCK_SSHD
-    cat > "$tmp/bin/systemctl" <<'MOCK_SYSTEMCTL'
-#!/bin/sh
-exit 0
-MOCK_SYSTEMCTL
+    make_mock_restart_success "$tmp/bin"
     chmod +x "$tmp/bin/sshd" "$tmp/bin/systemctl"
     PATH="$tmp/bin:$PATH"
     backup=$(latest_sshd_backup)
@@ -1252,10 +1190,7 @@ test_restore_sshd_removes_new_managed_dropin() {
 #!/bin/sh
 exit 0
 MOCK_SSHD
-    cat > "$tmp/bin/systemctl" <<'MOCK_SYSTEMCTL'
-#!/bin/sh
-exit 0
-MOCK_SYSTEMCTL
+    make_mock_restart_success "$tmp/bin"
     chmod +x "$tmp/bin/sshd" "$tmp/bin/systemctl"
     PATH="$tmp/bin:$PATH"
     backup=$(latest_sshd_backup)
@@ -1282,18 +1217,28 @@ test_match_authentication_methods_blocks_hardening() {
     export IKE_TEST_UID
     {
         printf '%s\n' "PasswordAuthentication yes"
-        printf '%s\n' "Match User admin"
+        printf '%s\n' "Match User testuser"
         printf '%s\n' "    AuthenticationMethods publickey,password"
     } > "$SSH_CONFIG"
+    old_path=$PATH
+    mkdir -p "$tmp/bin"
+    cp "$SSH_CONFIG" "$tmp/main-before"
+    make_mock_sshd_policy "$tmp/bin" auth-match
+    make_mock_restart_success "$tmp/bin"
+    PATH="$tmp/bin:$PATH"
     if (harden_ssh_config > "$tmp/out" 2>&1); then
         fail "Match AuthenticationMethods publickey,password blocks hardening"
-    elif grep -q "AuthenticationMethods publickey,password" "$tmp/out" &&
+    elif grep -q -- "-T .*user=testuser" "$tmp/bin/sshd-calls" &&
+        grep -iq "AuthenticationMethods publickey,password" "$tmp/out" &&
         grep -q "继续可能导致 SSH 无法登录" "$tmp/out" &&
-        [ "$(find "$tmp" -name 'sshd_config.bak.*' | wc -l | awk '{print $1}')" = "0" ]; then
+        grep -q "AuthenticationMethods 改为 publickey" "$tmp/out" &&
+        cmp -s "$SSH_CONFIG" "$tmp/main-before" &&
+        [ "$(permanent_backup_count "$tmp")" = 0 ]; then
         pass "Match AuthenticationMethods publickey,password blocks hardening"
     else
         fail "Match AuthenticationMethods publickey,password blocks hardening"
     fi
+    PATH=$old_path
     SSH_CONFIG=$old_ssh_config
     unset IKE_TEST_UID
     rm -rf "$tmp"
@@ -1324,19 +1269,21 @@ test_fetch_github_keys_wget_busybox_timeout() {
     cat > "$tmp/bin/wget" <<'MOCK_WGET'
 #!/bin/sh
 if [ "$1" = "--help" ]; then
-    printf '%s\n' "BusyBox wget mock"
+    printf '%s\n' "BusyBox v1.36.1" "--no-check-certificate"
     exit 0
 fi
 printf '%s\n' "$*" >> "$WGET_LOG"
 case "$*" in
     *-T\ 10*)
+        printf '%s\n' "  HTTP/1.1 200 OK" >&2
         printf '%s\n' 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBHiTtwHOMyc2QbrXv/15/f/TmESu5rAxMdF31qhnU8g test@example'
         exit 0
         ;;
 esac
 exit 1
 MOCK_WGET
-    chmod +x "$tmp/bin/wget"
+    printf '%s\n' '#!/bin/sh' '[ "$*" = version ]' > "$tmp/bin/openssl"
+    chmod +x "$tmp/bin/wget" "$tmp/bin/openssl"
     PATH="$tmp/bin:$PATH"
     output="$tmp/keys"
     WGET_LOG="$tmp/wget.log"
@@ -1348,7 +1295,7 @@ MOCK_WGET
         fetch_github_keys "ike-sh" "$output"
     ) >/dev/null 2>&1 &&
         grep -Fq 'ssh-ed25519' "$output" &&
-        grep -Fxq -- '-qO- -T 10 https://github.com/ike-sh.keys' "$WGET_LOG"; then
+        grep -Fxq -- '-S -Y off -qO- -T 10 https://github.com/ike-sh.keys' "$WGET_LOG"; then
         pass "fetch_github_keys uses wget -T fallback for BusyBox"
     else
         fail "fetch_github_keys uses wget -T fallback for BusyBox"
@@ -1378,10 +1325,7 @@ test_restore_both_rolls_back_sshd_when_auth_fails() {
 #!/bin/sh
 exit 0
 MOCK_SSHD
-    cat > "$tmp/bin/systemctl" <<'MOCK_SYSTEMCTL'
-#!/bin/sh
-exit 0
-MOCK_SYSTEMCTL
+    make_mock_restart_success "$tmp/bin"
     chmod +x "$tmp/bin/sshd" "$tmp/bin/systemctl"
     PATH="$tmp/bin:$PATH"
     if (restore_sshd_and_authorized_keys_from_backups "$SSH_CONFIG.bak.20260429_090000" "$auth.bak.missing" > "$tmp/out" 2>&1); then
@@ -1418,10 +1362,7 @@ test_restore_latest_sshd_config_backup() {
 #!/bin/sh
 exit 0
 MOCK_SSHD
-    cat > "$tmp/bin/systemctl" <<'MOCK_SYSTEMCTL'
-#!/bin/sh
-exit 0
-MOCK_SYSTEMCTL
+    make_mock_restart_success "$tmp/bin"
     chmod +x "$tmp/bin/sshd" "$tmp/bin/systemctl"
     PATH="$tmp/bin:$PATH"
     backup=$(latest_sshd_backup)
@@ -1459,10 +1400,7 @@ if [ "$1" = "-T" ]; then
 fi
 exit 0
 MOCK_SSHD
-    cat > "$tmp/bin/systemctl" <<'MOCK_SYSTEMCTL'
-#!/bin/sh
-exit 0
-MOCK_SYSTEMCTL
+    make_mock_restart_success "$tmp/bin"
     chmod +x "$tmp/bin/sshd" "$tmp/bin/systemctl"
     PATH="$tmp/bin:$PATH"
     backup=$(latest_sshd_backup)
@@ -1496,21 +1434,22 @@ test_restore_sshd_immutable_unlocks_and_relocks() {
     printf '%s\n' "PasswordAuthentication no" > "$SSH_CONFIG.bak.20260429_090000"
     cat > "$tmp/bin/lsattr" <<'MOCK_LSATTR'
 #!/bin/sh
-printf '%s\n' '----i---------e------- '"$1"
+attr=--------------e-------
+[ "$1" = -d ] && [ "$#" = 2 ] || exit 1
+if [ "$2" = "$SSH_CONFIG" ] && [ ! -f "${0%/*}/unlocked" ]; then attr=----i---------e-------; fi
+printf '%s %s\n' "$attr" "$2"
 MOCK_LSATTR
     cat > "$tmp/bin/chattr" <<'MOCK_CHATTR'
 #!/bin/sh
+[ "$2" = "$SSH_CONFIG" ] || exit 1
+case "$1" in -i) : > "${0%/*}/unlocked" ;; +i) rm -f "${0%/*}/unlocked" ;; *) exit 1 ;; esac
 printf '%s\n' "$*" >> "$CHATTR_LOG"
-exit 0
 MOCK_CHATTR
     cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
 #!/bin/sh
 exit 0
 MOCK_SSHD
-    cat > "$tmp/bin/systemctl" <<'MOCK_SYSTEMCTL'
-#!/bin/sh
-exit 0
-MOCK_SYSTEMCTL
+    make_mock_restart_success "$tmp/bin"
     chmod +x "$tmp/bin/lsattr" "$tmp/bin/chattr" "$tmp/bin/sshd" "$tmp/bin/systemctl"
     CHATTR_LOG="$tmp/chattr.log"
     export CHATTR_LOG
@@ -1547,12 +1486,16 @@ test_restore_sshd_t_failure_restores_and_relocks() {
     printf '%s\n' "PasswordAuthentication broken" > "$SSH_CONFIG.bak.20260429_090000"
     cat > "$tmp/bin/lsattr" <<'MOCK_LSATTR'
 #!/bin/sh
-printf '%s\n' '----i---------e------- '"$1"
+attr=--------------e-------
+[ "$1" = -d ] && [ "$#" = 2 ] || exit 1
+if [ "$2" = "$SSH_CONFIG" ] && [ ! -f "${0%/*}/unlocked" ]; then attr=----i---------e-------; fi
+printf '%s %s\n' "$attr" "$2"
 MOCK_LSATTR
     cat > "$tmp/bin/chattr" <<'MOCK_CHATTR'
 #!/bin/sh
+[ "$2" = "$SSH_CONFIG" ] || exit 1
+case "$1" in -i) : > "${0%/*}/unlocked" ;; +i) rm -f "${0%/*}/unlocked" ;; *) exit 1 ;; esac
 printf '%s\n' "$*" >> "$CHATTR_LOG"
-exit 0
 MOCK_CHATTR
     cat > "$tmp/bin/sshd" <<'MOCK_SSHD'
 #!/bin/sh
@@ -1562,6 +1505,7 @@ MOCK_SSHD
     CHATTR_LOG="$tmp/chattr.log"
     export CHATTR_LOG
     PATH="$tmp/bin:$PATH"
+    make_mock_restart_success "$tmp/bin"
     backup=$(latest_sshd_backup)
     if restore_sshd_config_from_backup "$backup" > "$tmp/out" 2>&1; then
         fail "restore sshd_config sshd -t failure restores and relocks"
@@ -1645,21 +1589,25 @@ test_clear_authorized_keys_requires_yes() {
 
 test_clear_authorized_keys_backup_and_empty() {
     tmp=$(make_test_dir)
+    old_ssh_config=$SSH_CONFIG; SSH_CONFIG=$tmp/sshd_config
     setup_home "$tmp"
     mkdir -p "$IKE_TEST_HOME/.ssh"
     auth="$IKE_TEST_HOME/.ssh/authorized_keys"
     printf '%s\n' "$VALID_KEY" > "$auth"
     printf '%s\n' "YES" > "$tmp/in"
     clear_authorized_keys_interactive < "$tmp/in" > "$tmp/out" 2>&1
-    backup_count=$(find "$IKE_TEST_HOME/.ssh" -name 'authorized_keys.before-clear.*' | wc -l | awk '{print $1}')
+    batch="$SSH_CONFIG.ssh-init.d/batch.000000000001"
+    backup_count=$(permanent_backup_count "$SSH_CONFIG.ssh-init.d")
     lines=$(wc -l < "$auth" | awk '{print $1}')
     if [ "$backup_count" = "1" ] &&
+        grep -Fxq "$auth" "$batch/auth.path" && grep -Fxq "$VALID_KEY" "$batch/auth.data" &&
         [ "$lines" = "0" ] &&
         has_mode "$auth" 600; then
         pass "clear authorized_keys backs up then empties file"
     else
         fail "clear authorized_keys backs up then empties file"
     fi
+    SSH_CONFIG=$old_ssh_config
     clear_test_user
     rm -rf "$tmp"
 }
@@ -2016,7 +1964,7 @@ MOCK_SSHD
         grep -q "passwordauthentication yes" "$tmp/out" &&
         grep -q "1:PasswordAuthentication yes" "$tmp/out" &&
         [ "$(cat "$SSH_CONFIG")" = "$before" ] &&
-        [ "$(find "$tmp" -name 'sshd_config.bak.*' | wc -l | awk '{print $1}')" = "0" ]; then
+        [ "$(permanent_backup_count "$tmp")" = 0 ]; then
         pass "--debug-effective reports final values without modifying config"
     else
         fail "--debug-effective reports final values without modifying config"

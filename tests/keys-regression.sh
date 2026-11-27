@@ -110,6 +110,8 @@ keys_regression_gen_case() {
         # Invoked indirectly by gen_mode from the separately sourced init.sh.
         # shellcheck disable=SC2317,SC2329
         harden_ssh_config() {
+            [ "$#" = 1 ] || die 'missing transaction key argument'
+            append_keys_to_authorized_keys "$1" || return 1
             printf '%s\n' "MOCK_HARDEN"
             printf '%s\n' "PasswordAuthentication no" > "$keys_case_tmp/sshd_config"
         }
@@ -152,12 +154,12 @@ keys_regression_gen_case() {
                 /^ssh-ed25519 / { public_line = NR }
                 /^MOCK-PRIVATE-KEY-ONLY-FOR-TESTS$/ { private_line = NR }
                 /确认私钥已保存到本地/ { confirm_line = NR }
-                /^MOCK_APPEND$/ { append_line = NR }
-                /^MOCK_HARDEN$/ { harden_line = NR }
+                /^MOCK_APPEND$/ { append_line = NR; appends++ }
+                /^MOCK_HARDEN$/ { harden_line = NR; transactions++ }
                 END {
                     exit !(public_line > 0 && private_line > public_line &&
                         confirm_line > private_line && append_line > confirm_line &&
-                        harden_line > append_line)
+                        harden_line > append_line && appends == 1 && transactions == 1)
                 }
             ' "$keys_case_tmp/out" || exit 1
         else
